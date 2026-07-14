@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+scripts/
+
+# Build
+dist/
+target/
+apps/desktop/src-tauri/target/
+*.tsbuildinfo
+
+# Tauri / OS
+.DS_Store
+Thumbs.db
+*.log
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Local app data must never be committed
+.mprism/
+**/.mprism/
+
+# Test / coverage
+coverage/
+playwright-report/
+test-results/
+docs/
+.factory/
+
+*.lcov
+
+# Generated icons source only keep icons dir contents
+app-icon.png

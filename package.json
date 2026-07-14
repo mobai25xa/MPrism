@@ -1,0 +1,24 @@
+{
+  "name": "mprism",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.20.0",
+  "scripts": {
+    "dev": "pnpm --filter mprism-desktop dev",
+    "build": "pnpm --filter mprism-desktop build",
+    "lint": "pnpm --filter mprism-desktop lint",
+    "typecheck": "pnpm --filter mprism-desktop typecheck",
+    "test": "pnpm --filter mprism-desktop test",
+    "test:e2e": "pnpm --filter mprism-desktop test:e2e",
+    "tauri": "pnpm --filter mprism-desktop tauri",
+    "tauri:dev": "pnpm --filter mprism-desktop tauri dev",
+    "audit:production": "pwsh -File scripts/audit-production.ps1",
+    "tauri:build": "pnpm --filter mprism-desktop tauri build"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "@tauri-apps/cli"
+    ]
+  }
+}

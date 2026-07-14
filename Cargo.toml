@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/desktop/src-tauri",
+  "crates/mprism-protocol",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/mprism/mprism"
+
+[workspace.dependencies]
+mprism-protocol = { path = "crates/mprism-protocol" }

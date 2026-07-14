@@ -1,0 +1,934 @@
+:root {
+  /* color-scheme is set by applyResolvedTheme (fytheme dark/light) */
+  font-family: var(--myui-font-family-base);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  background-color: var(--myui-color-bg-page);
+  color: var(--myui-color-text-primary);
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+code,
+pre {
+  font-family: var(--myui-font-family-mono);
+}
+
+img,
+svg {
+  max-width: 100%;
+}
+
+/* App shell */
+.mprism-app {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  background: var(--myui-color-bg-page);
+  color: var(--myui-color-text-primary);
+}
+
+.mprism-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.mprism-center {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--myui-spacing-3);
+}
+
+/* Spinner */
+.mprism-spinner {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--myui-spacing-2);
+}
+
+.mprism-spinner--inline {
+  flex-direction: row;
+}
+
+.mprism-spinner .myui-loading__spinner {
+  width: 28px;
+  height: 28px;
+}
+
+/* Field layout */
+.mprism-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+}
+
+.mprism-field--horizontal {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  column-gap: 12px;
+  align-items: start;
+}
+
+.mprism-field__label {
+  padding-top: 6px;
+  color: var(--myui-color-text-primary);
+  font-size: var(--myui-font-size-2);
+  line-height: var(--myui-line-height-normal);
+  white-space: nowrap;
+}
+
+.mprism-field__required {
+  color: var(--myui-color-danger);
+  margin-left: 2px;
+}
+
+.mprism-field__control {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mprism-field__hint {
+  color: var(--myui-color-text-tertiary);
+  font-size: var(--myui-font-size-1);
+}
+
+/*
+ * Tooltip geometry:
+ * - default: absolute near trigger (toolbar icons)
+ * - portal: fixed on body (list titles inside overflow sidebars)
+ * Skin comes from @mobai6462/theme tooltip.css.
+ */
+.myui-tooltip {
+  position: relative;
+  display: inline-flex;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.mprism-tooltip-popper {
+  position: absolute !important;
+  white-space: nowrap;
+  pointer-events: none;
+  max-width: min(240px, 70vw);
+}
+
+.mprism-tooltip-popper--top {
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+}
+
+.mprism-tooltip-popper--bottom {
+  left: 50%;
+  top: calc(100% + 6px);
+  transform: translateX(-50%);
+}
+
+.mprism-tooltip-popper--right {
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.mprism-tooltip-popper--left {
+  right: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.mprism-tooltip-portal.myui-tooltip__popper {
+  position: fixed;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  max-width: min(280px, 40vw);
+}
+
+/* Dropdown: package skin; only block layout + icon slot are product-local */
+.mprism-menu-icon {
+  display: inline-flex;
+  margin-right: 8px;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+.myui-dropdown--block,
+.myui-dropdown__trigger--block {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.myui-dropdown--block .myui-app-nav__item {
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/*
+ * Select portal: package uses absolute under trigger; we portal to body with JS fixed box.
+ */
+.mprism-select-portal.myui-select__dropdown {
+  position: fixed;
+  bottom: auto;
+  right: auto;
+  box-sizing: border-box;
+  overflow: auto;
+}
+
+.mprism-composer-select.myui-select {
+  width: auto;
+  min-width: 120px;
+  max-width: 180px;
+  flex: 0 1 auto;
+}
+
+/*
+ * App shell integration (@mobai6462/theme app-shell.css).
+ * Official classes: myui-app-rail / myui-app-nav / myui-app-main.
+ * Only product-specific layout (flex shell, resizable nav, multi-line items) lives here.
+ */
+
+.mprism-shell {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+
+/* Left icon rail fills height inside flex shell (grid shell not used). */
+.myui-app-rail {
+  height: 100%;
+  flex: 0 0 var(--myui-layout-rail-width);
+}
+
+/* Session / provider nav column */
+.myui-app-nav {
+  height: 100%;
+  flex: 0 0 auto;
+  position: relative;
+  width: var(--myui-layout-nav-width);
+  min-width: 0;
+}
+
+.myui-app-nav--collapsed {
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
+  align-items: center;
+  padding-top: var(--myui-spacing-2);
+  gap: var(--myui-spacing-1);
+}
+
+.myui-app-nav--collapsed .myui-app-nav__head,
+.myui-app-nav--collapsed .myui-app-nav__body {
+  display: none;
+}
+
+.myui-app-nav__head .mprism-title3 {
+  font-size: var(--myui-font-size-2);
+  font-weight: var(--myui-font-weight-medium);
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.myui-app-nav__head-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.myui-app-nav__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--myui-spacing-1);
+}
+
+.myui-app-nav__body > .myui-dropdown {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Multi-line list rows (session / provider cards) built on nav item surface */
+.myui-app-nav__item {
+  height: auto;
+  min-height: calc(var(--myui-nav-item-height) + 16px);
+  align-items: flex-start;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.myui-app-nav__item-main {
+  display: flex;
+  width: 100%;
+  max-width: 100%;
+  align-items: center;
+  gap: var(--myui-spacing-2);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.myui-app-nav__item-text {
+  flex: 1;
+  min-width: 0;
+  max-width: 100%;
+  text-align: left;
+  overflow: hidden;
+}
+
+.myui-app-nav__item-title {
+  display: block;
+  width: 100%;
+  font-weight: var(--myui-font-weight-medium);
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.myui-app-nav__item-meta {
+  flex-shrink: 0;
+  margin-top: 2px;
+  font-size: var(--myui-font-size-1);
+  color: var(--myui-color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.myui-app-nav__item-text .myui-app-nav__item-meta {
+  display: block;
+  flex: none;
+}
+
+/* Resize grip for session/provider nav */
+.mprism-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 2;
+  touch-action: none;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+.mprism-resize-handle:hover {
+  background: var(--myui-color-border-base);
+}
+
+.mprism-resize-handle:active {
+  background: var(--myui-color-primary);
+}
+
+/* Main workspace column */
+.myui-app-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.myui-app-main__toolbar {
+  flex-shrink: 0;
+}
+
+.myui-app-main__title.mprism-ellipsis,
+.mprism-ellipsis {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mprism-muted {
+  color: var(--myui-color-text-tertiary);
+  font-size: var(--myui-font-size-1);
+}
+
+.mprism-title3 {
+  margin: 0;
+  font-size: var(--myui-font-size-4);
+  font-weight: var(--myui-font-weight-semibold);
+  color: var(--myui-color-text-primary);
+  line-height: var(--myui-line-height-tight);
+}
+
+.mprism-body {
+  margin: 0;
+  font-size: var(--myui-font-size-2);
+  line-height: var(--myui-line-height-normal);
+  color: var(--myui-color-text-primary);
+}
+
+.mprism-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+}
+
+/* Chat */
+.mprism-thread-row {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
+.mprism-messages {
+  height: 100%;
+  overflow-y: auto;
+  padding: 16px;
+  background: var(--myui-color-bg-container);
+}
+
+.mprism-messages-inner {
+  max-width: 880px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mprism-user-bubble {
+  align-self: flex-end;
+  max-width: 75%;
+  background: var(--myui-color-primary-bg);
+  color: var(--myui-color-text-primary);
+  border: 1px solid var(--myui-color-primary-border);
+  border-radius: var(--myui-radius-2);
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  scroll-margin-top: 12px;
+}
+
+.mprism-assistant {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mprism-assistant-meta {
+  font-size: var(--myui-font-size-1);
+  color: var(--myui-color-text-tertiary);
+}
+
+.mprism-reasoning {
+  border-left: 2px solid var(--myui-color-border-base);
+  padding-left: 10px;
+  margin-bottom: 4px;
+}
+
+.mprism-reasoning summary {
+  color: var(--myui-color-text-tertiary);
+  font-size: var(--myui-font-size-1);
+  cursor: pointer;
+  margin-bottom: 4px;
+}
+
+.mprism-reasoning-body {
+  color: var(--myui-color-text-tertiary);
+  font-size: var(--myui-font-size-1);
+  line-height: var(--myui-line-height-normal);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.mprism-markdown {
+  line-height: 1.55;
+  word-break: break-word;
+}
+
+.mprism-markdown pre {
+  overflow-x: auto;
+  padding: 12px;
+  border-radius: 6px;
+  background: var(--myui-color-bg-inset);
+  border: 1px solid var(--myui-color-border-light);
+}
+
+.mprism-markdown code {
+  font-family: var(--myui-font-family-mono);
+}
+
+.mprism-markdown table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.mprism-markdown th,
+.mprism-markdown td {
+  border: 1px solid var(--myui-color-border-base);
+  padding: 4px 8px;
+}
+
+.mprism-typing {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 22px;
+  padding: 2px 0;
+}
+
+.mprism-typing__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--myui-color-text-tertiary);
+  animation: mprism-typing 1.05s ease-in-out infinite;
+}
+
+.mprism-typing__dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.mprism-typing__dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes mprism-typing {
+  0%,
+  80%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+.mprism-composer-wrap {
+  padding: 12px 16px 16px;
+  background: var(--myui-color-bg-container);
+}
+
+.mprism-composer-box {
+  max-width: 880px;
+  margin: 0 auto;
+  border: 1px solid var(--myui-color-border-base);
+  border-radius: 12px;
+  background: var(--myui-color-bg-elevated);
+  display: flex;
+  flex-direction: column;
+  /* avoid clipping; select menus portal to body but other chrome should not overflow awkwardly */
+  overflow: visible;
+}
+
+.mprism-composer-box .mprism-textarea {
+  border: none;
+}
+
+.mprism-composer-box .myui-textarea__inner {
+  min-height: 44px;
+  max-height: 180px;
+  border: none;
+  box-shadow: none;
+  background: transparent;
+  resize: none;
+}
+
+.mprism-composer-box .myui-textarea__inner:focus {
+  box-shadow: none;
+  border-color: transparent;
+}
+
+.mprism-composer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 10px;
+  flex-wrap: wrap;
+}
+
+.mprism-composer-spacer {
+  flex: 1;
+  min-width: 8px;
+}
+
+/* Chat scroll-to-bottom: reuse BackTop surface, sticky inside thread instead of fixed viewport. */
+.mprism-scroll-fab.myui-back-top {
+  position: sticky;
+  right: auto;
+  bottom: 12px;
+  align-self: center;
+  margin-top: auto;
+  z-index: 4;
+}
+
+/*
+ * Chat outline: official Timeline DOM (right mode).
+ * - Default: slim transparent rail
+ * - Hover outline: elevated card chrome
+ * - Hover item: truncated title left of dot + full question tip further left
+ */
+.mprism-chat-outline {
+  --mprism-outline-rail: calc(var(--myui-timeline-dot-size) + 8px);
+  --mprism-outline-label-gap: 10px;
+  --mprism-outline-label-max: min(220px, 34vw);
+  --mprism-outline-pad-y: var(--myui-spacing-2);
+  --mprism-outline-pad-x: var(--myui-spacing-2);
+
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 3;
+  width: calc(
+    var(--mprism-outline-label-max) + var(--mprism-outline-label-gap) + var(--mprism-outline-rail) +
+      var(--mprism-outline-pad-x) * 2
+  );
+  max-height: min(52vh, 360px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: var(--mprism-outline-pad-y) var(--mprism-outline-pad-x);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--myui-radius-card, var(--myui-radius-3));
+  box-shadow: none;
+  scrollbar-width: thin;
+  pointer-events: none;
+  transition:
+    background-color var(--myui-duration-fast) var(--myui-easing-standard),
+    border-color var(--myui-duration-fast) var(--myui-easing-standard),
+    box-shadow var(--myui-duration-fast) var(--myui-easing-standard);
+}
+
+.mprism-chat-outline:hover,
+.mprism-chat-outline:focus-within {
+  background: var(--myui-color-bg-elevated);
+  border-color: var(--myui-color-border-light);
+  box-shadow: var(--myui-shadow-2);
+  pointer-events: auto;
+}
+
+.mprism-chat-outline__timeline {
+  position: relative;
+  width: var(--mprism-outline-rail);
+  margin: 0 0 0 auto;
+  padding: 0;
+  overflow: visible;
+  pointer-events: auto;
+}
+
+.mprism-chat-outline .myui-timeline__item {
+  position: relative;
+  display: flex;
+  flex-direction: row-reverse;
+  align-items: flex-start;
+  justify-content: flex-start;
+  width: 100%;
+  padding-bottom: var(--myui-timeline-gap);
+  overflow: visible;
+}
+
+.mprism-chat-outline .myui-timeline__item:last-child {
+  padding-bottom: 0;
+}
+
+.mprism-chat-outline__dot-hit {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: var(--mprism-outline-rail);
+  bottom: 0;
+  z-index: 3;
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  appearance: none;
+  pointer-events: auto;
+}
+
+.mprism-chat-outline .myui-timeline__dot {
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
+/* All truncated titles appear when the outline card is hovered (directory mode). */
+.mprism-chat-outline .myui-timeline__body {
+  position: absolute;
+  right: calc(var(--mprism-outline-rail) + var(--mprism-outline-label-gap));
+  top: 0;
+  left: auto;
+  flex: none;
+  width: max-content;
+  max-width: var(--mprism-outline-label-max);
+  min-width: 0;
+  margin: 0 !important;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateX(4px);
+  transition:
+    opacity var(--myui-duration-fast) var(--myui-easing-standard),
+    transform var(--myui-duration-fast) var(--myui-easing-standard),
+    visibility var(--myui-duration-fast) var(--myui-easing-standard);
+  z-index: 4;
+}
+
+.mprism-chat-outline:hover .myui-timeline__body,
+.mprism-chat-outline:focus-within .myui-timeline__body {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateX(0);
+}
+
+.mprism-chat-outline__content.myui-timeline__content,
+.mprism-chat-outline .myui-timeline__content {
+  display: block;
+  width: 100%;
+  max-width: var(--mprism-outline-label-max);
+  margin: 0;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--myui-timeline-content-color);
+  font: inherit;
+  font-size: var(--myui-font-size-1);
+  font-weight: var(--myui-font-weight-regular);
+  line-height: var(--myui-line-height-tight);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  appearance: none;
+}
+
+/* Row emphasis only; titles are already all-visible in card hover state */
+.mprism-chat-outline .myui-timeline__item:hover .myui-timeline__content,
+.mprism-chat-outline .myui-timeline__item:focus-within .myui-timeline__content {
+  color: var(--myui-color-text-primary);
+}
+
+.mprism-chat-outline .myui-timeline__item:hover .myui-timeline__dot,
+.mprism-chat-outline .myui-timeline__item:focus-within .myui-timeline__dot {
+  border-color: var(--myui-color-primary);
+}
+
+.mprism-chat-outline .myui-timeline__tail {
+  right: calc(var(--myui-timeline-dot-size) / 2 - 1px);
+  left: auto;
+}
+
+/* Full question tip: portal fixed, outside left of outline card (never inside card) */
+.mprism-chat-outline-fulltip-popper {
+  box-sizing: border-box;
+  max-width: min(280px, 40vw);
+  padding: var(--myui-spacing-2) var(--myui-spacing-3);
+  pointer-events: auto;
+  white-space: normal;
+}
+
+.mprism-chat-outline-fulltip {
+  display: block;
+  max-height: min(220px, 40vh);
+  overflow-x: hidden;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: var(--myui-font-size-1);
+  line-height: var(--myui-line-height-normal);
+  text-align: left;
+  color: var(--myui-tooltip-text);
+  scrollbar-width: thin;
+}
+
+.mprism-chat-outline .myui-timeline__item.is-tip-open .myui-timeline__content {
+  color: var(--myui-color-text-primary);
+}
+
+/* Settings page specifics */
+.mprism-detail {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  background: var(--myui-color-bg-container);
+}
+
+.mprism-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mprism-form-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 880px;
+  width: 100%;
+}
+
+.mprism-action-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  padding-left: 124px;
+}
+
+.mprism-key-row {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  min-width: 0;
+}
+
+.mprism-key-row .mprism-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.mprism-model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 960px;
+}
+
+.mprism-model-card {
+  border: 1px solid var(--myui-color-border-light);
+  border-radius: var(--myui-radius-card);
+  background: var(--myui-color-bg-elevated);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.mprism-model-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mprism-model-id {
+  font-family: var(--myui-font-family-mono);
+  font-size: var(--myui-font-size-1);
+  color: var(--myui-color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mprism-model-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+  width: 100%;
+}
+
+.mprism-discover-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  max-width: 960px;
+}
+
+.mprism-discover-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) minmax(0, 1.2fr);
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--myui-color-border-light);
+  min-width: 0;
+}
+
+.mprism-saved-icon {
+  color: var(--myui-color-success);
+  display: flex;
+  flex-shrink: 0;
+}
+
+.mprism-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* Code block header */
+.mprism-code-head {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--myui-color-text-secondary);
+}

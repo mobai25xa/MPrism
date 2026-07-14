@@ -1,0 +1,133 @@
+/*
+ * Code block syntax colors that track fytheme dual theme.
+ * Prefer CSS variables already set by @mobai6462/theme/base.css.
+ */
+
+.mprism-markdown pre code.hljs {
+  display: block;
+  overflow-x: auto;
+  background: transparent;
+  padding: 0;
+  color: var(--myui-color-text-primary);
+}
+
+/* Dark (default :root or data-theme=dark) — warm console tokens */
+:root .mprism-markdown .hljs-comment,
+:root .mprism-markdown .hljs-quote,
+:root[data-theme="dark"] .mprism-markdown .hljs-comment,
+:root[data-theme="dark"] .mprism-markdown .hljs-quote {
+  color: var(--myui-color-text-tertiary);
+  font-style: italic;
+}
+
+:root .mprism-markdown .hljs-keyword,
+:root .mprism-markdown .hljs-selector-tag,
+:root .mprism-markdown .hljs-subst,
+:root[data-theme="dark"] .mprism-markdown .hljs-keyword,
+:root[data-theme="dark"] .mprism-markdown .hljs-selector-tag,
+:root[data-theme="dark"] .mprism-markdown .hljs-subst {
+  color: var(--myui-orange-11);
+  font-weight: var(--myui-font-weight-medium);
+}
+
+:root .mprism-markdown .hljs-number,
+:root .mprism-markdown .hljs-literal,
+:root .mprism-markdown .hljs-variable,
+:root .mprism-markdown .hljs-template-variable,
+:root .mprism-markdown .hljs-tag .hljs-attr,
+:root[data-theme="dark"] .mprism-markdown .hljs-number,
+:root[data-theme="dark"] .mprism-markdown .hljs-literal,
+:root[data-theme="dark"] .mprism-markdown .hljs-variable,
+:root[data-theme="dark"] .mprism-markdown .hljs-template-variable,
+:root[data-theme="dark"] .mprism-markdown .hljs-tag .hljs-attr {
+  color: var(--myui-orange-10);
+}
+
+:root .mprism-markdown .hljs-string,
+:root .mprism-markdown .hljs-doctag,
+:root[data-theme="dark"] .mprism-markdown .hljs-string,
+:root[data-theme="dark"] .mprism-markdown .hljs-doctag {
+  color: var(--myui-green-10);
+}
+
+:root .mprism-markdown .hljs-title,
+:root .mprism-markdown .hljs-section,
+:root .mprism-markdown .hljs-selector-id,
+:root[data-theme="dark"] .mprism-markdown .hljs-title,
+:root[data-theme="dark"] .mprism-markdown .hljs-section,
+:root[data-theme="dark"] .mprism-markdown .hljs-selector-id {
+  color: var(--myui-blue-10);
+  font-weight: var(--myui-font-weight-medium);
+}
+
+:root .mprism-markdown .hljs-type,
+:root .mprism-markdown .hljs-class .hljs-title,
+:root .mprism-markdown .hljs-built_in,
+:root[data-theme="dark"] .mprism-markdown .hljs-type,
+:root[data-theme="dark"] .mprism-markdown .hljs-class .hljs-title,
+:root[data-theme="dark"] .mprism-markdown .hljs-built_in {
+  color: var(--myui-cyan-10);
+}
+
+:root .mprism-markdown .hljs-meta,
+:root .mprism-markdown .hljs-attr,
+:root[data-theme="dark"] .mprism-markdown .hljs-meta,
+:root[data-theme="dark"] .mprism-markdown .hljs-attr {
+  color: var(--myui-purple-10);
+}
+
+:root .mprism-markdown .hljs-symbol,
+:root .mprism-markdown .hljs-bullet,
+:root .mprism-markdown .hljs-link,
+:root[data-theme="dark"] .mprism-markdown .hljs-symbol,
+:root[data-theme="dark"] .mprism-markdown .hljs-bullet,
+:root[data-theme="dark"] .mprism-markdown .hljs-link {
+  color: var(--myui-color-primary);
+}
+
+:root .mprism-markdown .hljs-deletion,
+:root[data-theme="dark"] .mprism-markdown .hljs-deletion {
+  color: var(--myui-color-danger);
+}
+
+:root .mprism-markdown .hljs-addition,
+:root[data-theme="dark"] .mprism-markdown .hljs-addition {
+  color: var(--myui-color-success);
+}
+
+/* Light: [data-theme=light] uses the same semantic tokens (already flipped by base.css) */
+:root[data-theme="light"] .mprism-markdown .hljs-keyword,
+:root[data-theme="light"] .mprism-markdown .hljs-selector-tag,
+:root[data-theme="light"] .mprism-markdown .hljs-subst {
+  color: var(--myui-orange-8);
+}
+
+:root[data-theme="light"] .mprism-markdown .hljs-number,
+:root[data-theme="light"] .mprism-markdown .hljs-literal,
+:root[data-theme="light"] .mprism-markdown .hljs-variable,
+:root[data-theme="light"] .mprism-markdown .hljs-template-variable,
+:root[data-theme="light"] .mprism-markdown .hljs-tag .hljs-attr {
+  color: var(--myui-orange-7);
+}
+
+:root[data-theme="light"] .mprism-markdown .hljs-string,
+:root[data-theme="light"] .mprism-markdown .hljs-doctag {
+  color: var(--myui-green-8);
+}
+
+:root[data-theme="light"] .mprism-markdown .hljs-title,
+:root[data-theme="light"] .mprism-markdown .hljs-section,
+:root[data-theme="light"] .mprism-markdown .hljs-selector-id {
+  color: var(--myui-blue-7);
+}
+
+:root[data-theme="light"] .mprism-markdown .hljs-type,
+:root[data-theme="light"] .mprism-markdown .hljs-class .hljs-title,
+:root[data-theme="light"] .mprism-markdown .hljs-built_in {
+  color: var(--myui-cyan-7);
+}
+
+:root[data-theme="light"] .mprism-markdown .hljs-meta,
+:root[data-theme="light"] .mprism-markdown .hljs-attr {
+  color: var(--myui-purple-7);
+}
