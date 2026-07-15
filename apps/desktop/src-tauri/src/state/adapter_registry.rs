@@ -25,4 +25,10 @@ impl AdapterRegistry {
             .cloned()
             .ok_or_else(|| AppError::new("protocol", "当前协议未启用", false))
     }
+
+    pub fn list_kinds(&self) -> Vec<ProtocolKind> {
+        let mut kinds: Vec<_> = self.adapters.keys().copied().collect();
+        kinds.sort_by_key(|k| format!("{k:?}"));
+        kinds
+    }
 }

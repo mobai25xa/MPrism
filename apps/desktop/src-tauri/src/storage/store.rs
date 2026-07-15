@@ -9,11 +9,12 @@ use parking_lot::Mutex;
 use uuid::Uuid;
 
 use super::atomic::cleanup_stale_temp_files;
+use super::attachments::{self, AttachmentPublic};
 use super::device;
 use super::error::{StorageError, StorageResult};
 use super::logs::AppLogger;
 use super::messages::{self, LoadMessagesResult};
-use super::paths::{self, logs_dir, sessions_dir};
+use super::paths::{self, attachments_dir, logs_dir, sessions_dir};
 use super::sessions::{self, SessionUpdate};
 use super::settings::{self, ProviderPublic, ProviderUpsert};
 use super::types::{DeviceDocument, MessageRecord, SessionMeta, SettingsDocument, ThemePreference};
@@ -34,6 +35,8 @@ impl FileStore {
         fs::create_dir_all(sessions_dir(&root))
             .map_err(|e| StorageError::io(sessions_dir(&root), e))?;
         fs::create_dir_all(logs_dir(&root)).map_err(|e| StorageError::io(logs_dir(&root), e))?;
+        fs::create_dir_all(attachments_dir(&root))
+            .map_err(|e| StorageError::io(attachments_dir(&root), e))?;
         let _ = cleanup_stale_temp_files(&root);
         let device = device::load_or_create_device(&root)?;
         // Ensure settings exist.
@@ -198,5 +201,35 @@ impl FileStore {
         let lock = self.lock_session(session_id);
         let _g = lock.lock();
         messages::next_sequence(&self.root, session_id)
+    }
+
+    // --- attachments ---
+
+    pub fn import_attachment(
+        &self,
+        bytes: &[u8],
+        media_type: &str,
+        original_name: Option<String>,
+    ) -> StorageResult<AttachmentPublic> {
+        let public = attachments::import_bytes(&self.root, bytes, media_type, original_name)?;
+        self.logger.info(&format!(
+            "attachment imported id={} media_type={} bytes={}",
+            public.id, public.media_type, public.byte_len
+        ));
+        Ok(public)
+    }
+
+    pub fn load_attachment_bytes(
+        &self,
+        attachment_id: Uuid,
+    ) -> StorageResult<(attachments::AttachmentMeta, Vec<u8>)> {
+        attachments::load_bytes(&self.root, attachment_id)
+    }
+
+    pub fn load_attachment_meta(
+        &self,
+        attachment_id: Uuid,
+    ) -> StorageResult<attachments::AttachmentMeta> {
+        attachments::load_meta(&self.root, attachment_id)
     }
 }

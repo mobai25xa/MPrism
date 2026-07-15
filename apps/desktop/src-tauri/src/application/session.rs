@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
-use mprism_protocol::{ChatMessage, ChatRole};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use mprism_protocol::{ChatMessage, ChatRole, ContentPart};
 use uuid::Uuid;
 
-use crate::storage::{AssistantStatus, FileStore, MessageRole, SessionMeta, SessionUpdate};
+use crate::storage::{
+    AssistantStatus, FileStore, MessageAttachmentRef, MessageRecord, MessageRole, SessionMeta,
+    SessionUpdate,
+};
 
 use super::{check_ipc_schema, AppError, LoadedSession, UpdateSessionInput, IPC_SCHEMA_VERSION};
 
@@ -83,7 +87,7 @@ impl SessionService {
         for message in loaded.messages {
             match message.role {
                 MessageRole::User => {
-                    context.push(ChatMessage::text(ChatRole::User, message.content))
+                    context.push(self.user_message_to_chat(&message)?);
                 }
                 MessageRole::Assistant => {
                     let include = matches!(
@@ -97,5 +101,46 @@ impl SessionService {
             }
         }
         Ok(context)
+    }
+
+    fn user_message_to_chat(&self, message: &MessageRecord) -> Result<ChatMessage, AppError> {
+        if message.attachments.is_empty() {
+            return Ok(ChatMessage::text(ChatRole::User, message.content.clone()));
+        }
+        let mut parts = Vec::new();
+        if !message.content.trim().is_empty() {
+            parts.push(ContentPart::Text {
+                text: message.content.clone(),
+            });
+        }
+        for reference in &message.attachments {
+            parts.push(self.attachment_to_image_part(reference)?);
+        }
+        if parts.is_empty() {
+            return Err(AppError::validation("含附件的用户消息无效"));
+        }
+        Ok(ChatMessage {
+            role: ChatRole::User,
+            parts,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        })
+    }
+
+    fn attachment_to_image_part(
+        &self,
+        reference: &MessageAttachmentRef,
+    ) -> Result<ContentPart, AppError> {
+        let (meta, bytes) = self.store.load_attachment_bytes(reference.attachment_id)?;
+        let media_type = reference
+            .media_type
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(meta.media_type);
+        // Always ImageBase64 for Gemini compatibility and offline local blobs.
+        Ok(ContentPart::ImageBase64 {
+            media_type,
+            data: BASE64.encode(bytes),
+        })
     }
 }

@@ -4,20 +4,30 @@ import { errorMessageByCode, toAppError } from "../lib/errors";
 import * as api from "../lib/tauri";
 import type {
   AppError,
+  AttachmentPublic,
   BootstrapPayload,
   GenerationState,
   MessageRecord,
   ModelInfoPayload,
   ModelRecord,
+  ProtocolCapabilities,
   ProtocolId,
   ProviderPublic,
   SessionMeta,
+  StoredExtraHeader,
+  StoredToolChoice,
+  StoredToolDefinition,
   StreamEnvelope,
   ThemePreference,
 } from "../lib/types";
 import { IPC_SCHEMA_VERSION } from "../lib/types";
 import { readThemePreference, writeThemePreference } from "../app/theme";
-import { buildApiKeyUpdate } from "../features/providers/formLogic";
+import {
+  buildApiKeyUpdate,
+  normalizeStoredAuth,
+  normalizeStoredReasoning,
+  normalizeStoredTools,
+} from "../features/providers/formLogic";
 import {
   createGenerationState,
   reduceStreamEvent,
@@ -31,6 +41,10 @@ export type ProviderDraftState = {
   api_key_input: string;
   clear_key: boolean;
   models: ModelRecord[];
+  tools: StoredToolDefinition[];
+  tool_choice: StoredToolChoice | null;
+  extra_headers: StoredExtraHeader[];
+  api_key_query_param: string | null;
 };
 
 type AppStore = {
@@ -50,12 +64,16 @@ type AppStore = {
   discovered: ModelInfoPayload[];
   discoverError: string | null;
   modelSearch: string;
+  /** protocol id → capabilities (for settings/chat gating) */
+  protocolCapabilities: Record<string, ProtocolCapabilities>;
 
   sessions: SessionMeta[];
   activeSessionId: string | null;
   messagesBySession: Record<string, MessageRecord[]>;
   generations: Record<string, GenerationState>;
   draftsBySession: Record<string, string>;
+  /** Pending image attachments per session (local preview + imported ids). */
+  pendingAttachmentsBySession: Record<string, PendingAttachment[]>;
   chatLoading: boolean;
   chatError: string | null;
   partiallyCorruptBySession: Record<string, boolean>;
@@ -76,6 +94,7 @@ type AppStore = {
   setRetainedModels: (models: ModelRecord[]) => void;
   setDefaults: (providerId: string, modelId: string) => Promise<void>;
   clearDiscovered: () => void;
+  ensureProtocolCapabilities: (protocol: string) => Promise<ProtocolCapabilities | null>;
 
   selectSession: (sessionId: string | null) => Promise<void>;
   createSession: (title?: string) => Promise<SessionMeta | null>;
@@ -88,9 +107,19 @@ type AppStore = {
     modelId: string | null,
   ) => Promise<boolean>;
   setComposerDraft: (sessionId: string, text: string) => void;
+  addPendingAttachment: (sessionId: string, file: File) => Promise<boolean>;
+  removePendingAttachment: (sessionId: string, localId: string) => void;
+  clearPendingAttachments: (sessionId: string) => void;
   sendMessage: (sessionId: string, content: string) => Promise<void>;
   stopGeneration: (sessionId: string) => Promise<void>;
   reloadSessionMessages: (sessionId: string) => Promise<void>;
+};
+
+export type PendingAttachment = {
+  localId: string;
+  attachment: AttachmentPublic;
+  /** Object URL for local preview; revoke on remove. */
+  previewUrl: string;
 };
 
 const emptyDraft = (): ProviderDraftState => ({
@@ -100,6 +129,10 @@ const emptyDraft = (): ProviderDraftState => ({
   api_key_input: "",
   clear_key: false,
   models: [],
+  tools: [],
+  tool_choice: null,
+  extra_headers: [],
+  api_key_query_param: null,
 });
 
 const KNOWN_PROTOCOLS: readonly ProtocolId[] = [
@@ -116,6 +149,11 @@ function normalizeProtocol(protocol: ProviderPublic["protocol"]): ProtocolId {
 }
 
 function draftFromProvider(provider: ProviderPublic): ProviderDraftState {
+  const normalized = normalizeStoredTools(provider.tools ?? [], provider.tool_choice ?? null);
+  const auth = normalizeStoredAuth(
+    provider.extra_headers ?? [],
+    provider.api_key_query_param ?? null,
+  );
   return {
     name: provider.name,
     protocol: normalizeProtocol(provider.protocol),
@@ -123,6 +161,10 @@ function draftFromProvider(provider: ProviderPublic): ProviderDraftState {
     api_key_input: "",
     clear_key: false,
     models: provider.models.map((model) => ({ ...model })),
+    tools: normalized.tools,
+    tool_choice: normalized.tool_choice,
+    extra_headers: auth.extra_headers,
+    api_key_query_param: auth.api_key_query_param,
   };
 }
 
@@ -211,11 +253,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
   discovered: [],
   discoverError: null,
   modelSearch: "",
+  protocolCapabilities: {},
   sessions: [],
   activeSessionId: null,
   messagesBySession: {},
   generations: {},
   draftsBySession: {},
+  pendingAttachmentsBySession: {},
   chatLoading: false,
   chatError: null,
   partiallyCorruptBySession: {},
@@ -224,6 +268,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
     try {
       const payload = await api.bootstrap();
       applyBootstrap(set, payload);
+      try {
+        const caps = await api.listProtocolCapabilities();
+        const map: Record<string, ProtocolCapabilities> = {};
+        for (const item of caps) {
+          map[item.protocol] = item;
+        }
+        set({ protocolCapabilities: map });
+      } catch {
+        // optional: settings still work; gates fall back to fetch-on-demand
+      }
       const firstSession = payload.sessions[0]?.id;
       if (firstSession) {
         await get().selectSession(firstSession);
@@ -349,6 +403,28 @@ export const useAppStore = create<AppStore>((set, get) => ({
       apiKeyPresent: !isDraft,
     });
 
+    const caps = state.protocolCapabilities[draft.protocol];
+    const models = draft.models.map((model) => {
+      // Protocols without control must not persist On/Off (V1-compatible).
+      const reasoning =
+        caps && !caps.reasoning_control
+          ? null
+          : normalizeStoredReasoning(model.reasoning ?? null);
+      return { ...model, reasoning };
+    });
+    // Protocols without tools must not persist tools definitions (V1-compatible).
+    const toolsNormalized =
+      caps && !caps.tools
+        ? { tools: [] as typeof draft.tools, tool_choice: null }
+        : normalizeStoredTools(draft.tools, draft.tool_choice);
+    const authRaw = normalizeStoredAuth(draft.extra_headers, draft.api_key_query_param);
+    const authNormalized = {
+      extra_headers:
+        caps && !caps.custom_headers ? [] : authRaw.extra_headers,
+      api_key_query_param:
+        caps && !caps.api_key_query ? null : authRaw.api_key_query_param,
+    };
+
     try {
       const saved = await api.upsertProvider({
         schema_version: IPC_SCHEMA_VERSION,
@@ -357,7 +433,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
         protocol: draft.protocol,
         base_url: draft.base_url,
         api_key: apiKey,
-        models: draft.models,
+        models,
+        tools: toolsNormalized.tools,
+        tool_choice: toolsNormalized.tool_choice,
+        extra_headers: authNormalized.extra_headers,
+        api_key_query_param: authNormalized.api_key_query_param,
       });
       const providers = isDraft
         ? [...state.providers, saved]
@@ -496,6 +576,25 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   clearDiscovered() {
     set({ discovered: [], discoverError: null });
+  },
+
+  async ensureProtocolCapabilities(protocol) {
+    const cached = get().protocolCapabilities[protocol];
+    if (cached) {
+      return cached;
+    }
+    try {
+      const caps = await api.getProtocolCapabilities(protocol);
+      set((state) => ({
+        protocolCapabilities: {
+          ...state.protocolCapabilities,
+          [protocol]: caps,
+        },
+      }));
+      return caps;
+    } catch {
+      return null;
+    }
   },
 
   async selectSession(sessionId) {
@@ -647,6 +746,68 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }));
   },
 
+  async addPendingAttachment(sessionId, file) {
+    const current = get().pendingAttachmentsBySession[sessionId] ?? [];
+    if (current.length >= 8) {
+      set({ toast: "单次最多附带 8 张图片" });
+      return false;
+    }
+    try {
+      const buffer = await file.arrayBuffer();
+      const bytes = Array.from(new Uint8Array(buffer));
+      const imported = await api.importAttachment({
+        schema_version: IPC_SCHEMA_VERSION,
+        bytes,
+        media_type: file.type || "image/png",
+        original_name: file.name || null,
+      });
+      const previewUrl = URL.createObjectURL(file);
+      const pending: PendingAttachment = {
+        localId: `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        attachment: imported,
+        previewUrl,
+      };
+      set((s) => ({
+        pendingAttachmentsBySession: {
+          ...s.pendingAttachmentsBySession,
+          [sessionId]: [...(s.pendingAttachmentsBySession[sessionId] ?? []), pending],
+        },
+      }));
+      return true;
+    } catch (error) {
+      const appError = toAppError(error);
+      set({ toast: errorMessageByCode(appError) });
+      return false;
+    }
+  },
+
+  removePendingAttachment(sessionId, localId) {
+    set((s) => {
+      const list = s.pendingAttachmentsBySession[sessionId] ?? [];
+      const target = list.find((item) => item.localId === localId);
+      if (target) {
+        URL.revokeObjectURL(target.previewUrl);
+      }
+      return {
+        pendingAttachmentsBySession: {
+          ...s.pendingAttachmentsBySession,
+          [sessionId]: list.filter((item) => item.localId !== localId),
+        },
+      };
+    });
+  },
+
+  clearPendingAttachments(sessionId) {
+    set((s) => {
+      const list = s.pendingAttachmentsBySession[sessionId] ?? [];
+      for (const item of list) {
+        URL.revokeObjectURL(item.previewUrl);
+      }
+      const { [sessionId]: _, ...rest } = s.pendingAttachmentsBySession;
+      return { pendingAttachmentsBySession: rest };
+    });
+  },
+
   async sendMessage(sessionId, content) {
     const state = get();
     if (state.generations[sessionId]) {
@@ -664,7 +825,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
       return;
     }
     const trimmed = content.trim();
-    if (!trimmed) {
+    const pending = state.pendingAttachmentsBySession[sessionId] ?? [];
+    if (!trimmed && pending.length === 0) {
       return;
     }
 
@@ -676,17 +838,31 @@ export const useAppStore = create<AppStore>((set, get) => ({
       sequence: Date.now(),
       role: "user",
       content: trimmed,
+      attachments: pending.map((item) => ({
+        attachment_id: item.attachment.id,
+        media_type: item.attachment.media_type,
+      })),
       created_by_device_id: "local",
       created_at: new Date().toISOString(),
     };
     set((s) => ({
       draftsBySession: { ...s.draftsBySession, [sessionId]: "" },
+      pendingAttachmentsBySession: {
+        ...s.pendingAttachmentsBySession,
+        [sessionId]: [],
+      },
       messagesBySession: {
         ...s.messagesBySession,
         [sessionId]: [...(s.messagesBySession[sessionId] ?? []), optimistic],
       },
       chatError: null,
     }));
+    // Keep preview URLs only until reload; revoke later after success.
+    const previewUrls = pending.map((p) => p.previewUrl);
+
+    const provider = state.providers.find((p) => p.id === selection.providerId);
+    const model = provider?.models.find((m) => m.id === selection.modelId);
+    const reasoning = normalizeStoredReasoning(model?.reasoning ?? null);
 
     try {
       const finalAssistant = await api.startChat(
@@ -696,6 +872,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
           provider_id: selection.providerId,
           model_id: selection.modelId,
           content: trimmed,
+          reasoning: reasoning ?? undefined,
+          attachments:
+            pending.length > 0
+              ? pending.map((item) => ({
+                  id: item.attachment.id,
+                  media_type: item.attachment.media_type,
+                }))
+              : undefined,
         },
         (envelope: StreamEnvelope) => {
           const current = get().generations[sessionId];
@@ -757,9 +941,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
           },
         };
       });
+      for (const url of previewUrls) {
+        URL.revokeObjectURL(url);
+      }
       void finalAssistant;
     } catch (error) {
       const appError = toAppError(error);
+      for (const url of previewUrls) {
+        URL.revokeObjectURL(url);
+      }
       // keep optimistic user if backend may have persisted; reload best-effort
       try {
         const loaded = await api.loadSession(sessionId);

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use mprism_protocol::{ModelInfo, ProtocolKind, ProviderEndpoint, SecretString};
+use mprism_protocol::{
+    AuthOptions, ModelInfo, ProtocolCapabilities, ProtocolKind, ProviderEndpoint, SecretString,
+};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
@@ -11,7 +13,8 @@ use crate::storage::{
 };
 
 use super::{
-    check_ipc_schema, ApiKeyUpdateInput, AppError, ModelInfoPayload, ProviderDraft, ProviderInput,
+    check_ipc_schema, ApiKeyUpdateInput, AppError, ModelInfoPayload, ProtocolCapabilitiesPayload,
+    ProviderDraft, ProviderInput,
 };
 
 pub struct ProviderService {
@@ -59,6 +62,10 @@ impl ProviderService {
             base_url: input.base_url,
             api_key: key,
             models: input.models,
+            tools: input.tools,
+            tool_choice: input.tool_choice,
+            extra_headers: input.extra_headers,
+            api_key_query_param: input.api_key_query_param,
         })?;
         *self.settings.write() = doc;
         Ok(provider)
@@ -91,6 +98,27 @@ impl ProviderService {
         Ok(models.into_iter().map(ModelInfoPayload::from).collect())
     }
 
+    /// Capabilities for all registered adapters (UI gating).
+    pub fn list_protocol_capabilities(&self) -> Vec<ProtocolCapabilitiesPayload> {
+        self.adapters
+            .list_kinds()
+            .into_iter()
+            .filter_map(|kind| {
+                let adapter = self.adapters.get(kind).ok()?;
+                Some(capabilities_payload(kind, adapter.capabilities()))
+            })
+            .collect()
+    }
+
+    pub fn protocol_capabilities(
+        &self,
+        protocol: &str,
+    ) -> Result<ProtocolCapabilitiesPayload, AppError> {
+        let kind = parse_protocol_kind(protocol)?;
+        let adapter = self.adapters.get(kind)?;
+        Ok(capabilities_payload(kind, adapter.capabilities()))
+    }
+
     fn resolve_discovery_endpoint(
         &self,
         draft: ProviderDraft,
@@ -119,7 +147,39 @@ impl ProviderService {
                 .map(|p| p.api_key.clone())
                 .ok_or_else(|| AppError::validation("新服务商不能使用 keep API Key"))?,
         };
-        ProviderEndpoint::new(protocol, base_url, SecretString::new(key)).map_err(AppError::from)
+        let auth = match saved {
+            Some(p) => stored_auth_options(&p.extra_headers, p.api_key_query_param.as_deref()),
+            None => AuthOptions::default(),
+        };
+        build_provider_endpoint(protocol, base_url, key, auth)
+    }
+}
+
+/// Shared endpoint construction for chat + discovery (AuthOptions from settings).
+pub fn build_provider_endpoint(
+    protocol: ProtocolKind,
+    base_url: impl AsRef<str>,
+    api_key: impl Into<SecretString>,
+    auth: AuthOptions,
+) -> Result<ProviderEndpoint, AppError> {
+    let mut endpoint = ProviderEndpoint::new(protocol, base_url, api_key)?;
+    endpoint.auth = auth;
+    Ok(endpoint)
+}
+
+pub fn stored_auth_options(
+    extra_headers: &[crate::storage::StoredExtraHeader],
+    api_key_query_param: Option<&str>,
+) -> AuthOptions {
+    AuthOptions {
+        extra_headers: extra_headers
+            .iter()
+            .map(|h| (h.name.clone(), h.value.clone()))
+            .collect(),
+        api_key_query_param: api_key_query_param
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     }
 }
 
@@ -151,6 +211,33 @@ pub fn protocol_kind(protocol: StoredProtocol) -> ProtocolKind {
         StoredProtocol::OpenAiResponses => ProtocolKind::OpenAiResponses,
         StoredProtocol::AnthropicMessages => ProtocolKind::AnthropicMessages,
         StoredProtocol::GeminiGenerateContent => ProtocolKind::GeminiGenerateContent,
+    }
+}
+
+pub fn protocol_wire_id(kind: ProtocolKind) -> &'static str {
+    match kind {
+        ProtocolKind::OpenAiChatCompletions => "openai_chat_completions",
+        ProtocolKind::OpenAiResponses => "openai_responses",
+        ProtocolKind::AnthropicMessages => "anthropic_messages",
+        ProtocolKind::GeminiGenerateContent => "gemini_generate_content",
+    }
+}
+
+fn capabilities_payload(
+    kind: ProtocolKind,
+    caps: ProtocolCapabilities,
+) -> ProtocolCapabilitiesPayload {
+    ProtocolCapabilitiesPayload {
+        protocol: protocol_wire_id(kind).to_string(),
+        streaming: caps.streaming,
+        list_models: caps.list_models,
+        reasoning_output: caps.reasoning_output,
+        reasoning_control: caps.reasoning_control,
+        tools: caps.tools,
+        vision_input: caps.vision_input,
+        stream_usage: caps.stream_usage,
+        custom_headers: caps.custom_headers,
+        api_key_query: caps.api_key_query,
     }
 }
 

@@ -1,11 +1,14 @@
 import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
+  AttachmentPublic,
   BootstrapPayload,
   CancelChatPayload,
   ChatInput,
+  ImportAttachmentInput,
   LoadedSession,
   MessageRecord,
   ModelInfoPayload,
+  ProtocolCapabilities,
   ProviderDraft,
   ProviderInput,
   ProviderPublic,
@@ -80,6 +83,16 @@ export async function discoverModels(draft: ProviderDraft): Promise<ModelInfoPay
   return bridge.invoke<ModelInfoPayload[]>("discover_models", { draft });
 }
 
+export async function listProtocolCapabilities(): Promise<ProtocolCapabilities[]> {
+  return bridge.invoke<ProtocolCapabilities[]>("list_protocol_capabilities");
+}
+
+export async function getProtocolCapabilities(
+  protocol: string,
+): Promise<ProtocolCapabilities> {
+  return bridge.invoke<ProtocolCapabilities>("get_protocol_capabilities", { protocol });
+}
+
 export async function createSession(title?: string | null): Promise<SessionMeta> {
   return bridge.invoke<SessionMeta>("create_session", { title: title ?? null });
 }
@@ -101,6 +114,12 @@ export async function updateSession(
 
 export async function deleteSession(sessionId: string): Promise<UnitPayload> {
   return bridge.invoke<UnitPayload>("delete_session", { sessionId });
+}
+
+export async function importAttachment(
+  input: ImportAttachmentInput,
+): Promise<AttachmentPublic> {
+  return bridge.invoke<AttachmentPublic>("import_attachment", { input });
 }
 
 export async function startChat(

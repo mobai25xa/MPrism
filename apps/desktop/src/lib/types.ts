@@ -20,12 +20,51 @@ export type AppError = {
   provider_request_id?: string | null;
 };
 
+export type ReasoningModeId = "auto" | "off" | "on";
+export type ReasoningEffortId =
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+export type StoredReasoningSettings = {
+  /** auto | off | on — omit / auto ≡ no request control */
+  mode: ReasoningModeId | string;
+  effort?: ReasoningEffortId | string | null;
+  budget_tokens?: number | null;
+};
+
 export type ModelRecord = {
   id: string;
   display_name: string;
   source: ModelSource;
   temperature: number | null;
   max_tokens: number | null;
+  /** Model-level request reasoning; null/undefined ≡ auto */
+  reasoning?: StoredReasoningSettings | null;
+};
+
+/** Provider-level tool definition (wire passthrough; app does not execute). */
+export type StoredToolDefinition = {
+  name: string;
+  description?: string | null;
+  /** JSON Schema object */
+  parameters: Record<string, unknown> | object;
+};
+
+export type ToolChoiceModeId = "auto" | "none" | "required" | "named";
+
+export type StoredToolChoice = {
+  /** auto | none | required | named */
+  mode: ToolChoiceModeId | string;
+  name?: string | null;
+};
+
+export type StoredExtraHeader = {
+  name: string;
+  value: string;
 };
 
 export type ProviderPublic = {
@@ -35,6 +74,12 @@ export type ProviderPublic = {
   base_url: string;
   api_key_present: boolean;
   models: ModelRecord[];
+  /** Provider-level tools; omit/empty ≡ V1 no tools wire */
+  tools?: StoredToolDefinition[];
+  tool_choice?: StoredToolChoice | null;
+  /** AuthOptions (3.7); omit/empty ≡ V1 */
+  extra_headers?: StoredExtraHeader[];
+  api_key_query_param?: string | null;
   created_at: string;
   updated_at: string;
   revision: number;
@@ -69,6 +114,53 @@ export type TokenUsageRecord = {
   prompt_tokens?: number | null;
   completion_tokens?: number | null;
   total_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  cached_tokens?: number | null;
+};
+
+/** Mirrors mprism_protocol ProtocolCapabilities for UI gating. */
+export type ProtocolCapabilities = {
+  protocol: ProtocolId | string;
+  streaming: boolean;
+  list_models: boolean;
+  reasoning_output: boolean;
+  reasoning_control: boolean;
+  tools: boolean;
+  vision_input: boolean;
+  stream_usage: boolean;
+  custom_headers: boolean;
+  api_key_query: boolean;
+};
+
+export type ReasoningPolicyInput = {
+  mode: ReasoningModeId | string;
+  effort?: ReasoningEffortId | string | null;
+  budget_tokens?: number | null;
+};
+
+export type ChatAttachmentInput = {
+  id: string;
+  media_type?: string | null;
+};
+
+export type ImportAttachmentInput = {
+  schema_version: number;
+  bytes: number[];
+  media_type: string;
+  original_name?: string | null;
+};
+
+export type AttachmentPublic = {
+  id: string;
+  media_type: string;
+  byte_len: number;
+  original_name?: string | null;
+  created_at: string;
+};
+
+export type MessageAttachmentRef = {
+  attachment_id: string;
+  media_type?: string | null;
 };
 
 export type MessageErrorRecord = {
@@ -77,6 +169,15 @@ export type MessageErrorRecord = {
   retryable: boolean;
   http_status?: number | null;
   provider_request_id?: string | null;
+  retry_after_ms?: number | null;
+};
+
+/** Persisted / streamed tool call (display only). */
+export type StoredToolCall = {
+  id: string;
+  name: string;
+  arguments: string;
+  index?: number | null;
 };
 
 export type MessageRecord = {
@@ -93,6 +194,10 @@ export type MessageRecord = {
   model?: ModelSnapshot | null;
   usage?: TokenUsageRecord | null;
   finish_reason?: string | null;
+  /** Tool calls from stream; empty/missing on legacy messages. */
+  tool_calls?: StoredToolCall[];
+  /** Image attachment refs (no base64 in JSONL). */
+  attachments?: MessageAttachmentRef[];
   error?: MessageErrorRecord | null;
   created_by_device_id: string;
   created_at: string;
@@ -128,6 +233,10 @@ export type ProviderInput = {
   base_url: string;
   api_key: ApiKeyUpdateInput;
   models: ModelRecord[];
+  tools?: StoredToolDefinition[];
+  tool_choice?: StoredToolChoice | null;
+  extra_headers?: StoredExtraHeader[];
+  api_key_query_param?: string | null;
 };
 
 export type ProviderDraft = {
@@ -158,18 +267,50 @@ export type UpdateSessionInput = {
   last_model_id?: string | null;
 };
 
+export type ToolDefinitionInput = {
+  name: string;
+  description?: string | null;
+  parameters: Record<string, unknown> | object;
+};
+
+export type ToolChoiceInput = {
+  mode: ToolChoiceModeId | string;
+  name?: string | null;
+};
+
 export type ChatInput = {
   schema_version: number;
   session_id: string;
   provider_id: string;
   model_id: string;
   content: string;
+  /** Omit or mode auto → V1-compatible (no request-side reasoning control). */
+  reasoning?: ReasoningPolicyInput | null;
+  /** Image attachments (3.5). */
+  attachments?: ChatAttachmentInput[] | null;
+  /** Optional per-request tools override; omit → provider settings. */
+  tools?: ToolDefinitionInput[] | null;
+  tool_choice?: ToolChoiceInput | null;
 };
 
 export type StreamEventPayload =
   | { type: "started" }
   | { type: "reasoning_delta"; text: string }
   | { type: "content_delta"; text: string }
+  | {
+      type: "tool_call_delta";
+      id?: string | null;
+      name?: string | null;
+      arguments_delta: string;
+      index?: number | null;
+    }
+  | {
+      type: "tool_call_finished";
+      id: string;
+      name: string;
+      arguments: string;
+      index?: number | null;
+    }
   | { type: "usage"; usage: TokenUsageRecord }
   | { type: "completed"; finish_reason?: string | null }
   | { type: "stopped" }
@@ -191,6 +332,14 @@ export type CancelChatPayload = {
 
 export type GenerationPhase = "starting" | "streaming" | "cancelling";
 
+export type ToolCallState = {
+  id?: string | null;
+  name?: string | null;
+  arguments: string;
+  index?: number | null;
+  finished: boolean;
+};
+
 export type GenerationState = {
   requestId: string;
   sessionId: string;
@@ -198,6 +347,7 @@ export type GenerationState = {
   nextSequence: number;
   reasoning: string;
   content: string;
+  toolCalls: ToolCallState[];
   usage?: TokenUsageRecord;
   phase: GenerationPhase;
   error?: MessageErrorRecord | null;

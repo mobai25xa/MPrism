@@ -24,6 +24,16 @@ export type MessageKey =
   | "chat.reasoning"
   | "chat.stopped"
   | "chat.error"
+  | "chat.toolCalls"
+  | "chat.toolCallsReadonly"
+  | "chat.toolCallUnnamed"
+  | "chat.finishReason"
+  | "chat.retryAfter"
+  | "chat.attachImage"
+  | "chat.removeImage"
+  | "chat.pendingImages"
+  | "chat.imageAttachment"
+  | "chat.visionUnsupported"
   | "chat.selectProvider"
   | "chat.selectModel"
   | "chat.systemPrompt"
@@ -107,6 +117,59 @@ export type MessageKey =
   | "settings.models.isDefault"
   | "settings.models.discovering"
   | "settings.models.discoverFailed"
+  | "settings.reasoning.title"
+  | "settings.reasoning.mode"
+  | "settings.reasoning.modeAuto"
+  | "settings.reasoning.modeOff"
+  | "settings.reasoning.modeOn"
+  | "settings.reasoning.effort"
+  | "settings.reasoning.effortNone"
+  | "settings.reasoning.budget"
+  | "settings.reasoning.budgetPlaceholder"
+  | "settings.reasoning.requestVsResponse"
+  | "settings.reasoning.hintChatCompletions"
+  | "settings.reasoning.hintResponses"
+  | "settings.reasoning.hintAnthropic"
+  | "settings.reasoning.hintGemini"
+  | "settings.reasoning.hintGeneric"
+  | "settings.reasoning.unsupportedControl"
+  | "settings.reasoning.budgetInvalid"
+  | "settings.tools.title"
+  | "settings.tools.hint"
+  | "settings.tools.unsupported"
+  | "settings.tools.jsonLabel"
+  | "settings.tools.jsonPlaceholder"
+  | "settings.tools.toolChoice"
+  | "settings.tools.choiceAuto"
+  | "settings.tools.choiceNone"
+  | "settings.tools.choiceRequired"
+  | "settings.tools.choiceNamed"
+  | "settings.tools.namedTool"
+  | "settings.tools.jsonInvalid"
+  | "settings.tools.jsonMustBeArray"
+  | "settings.tools.itemInvalid"
+  | "settings.tools.nameRequired"
+  | "settings.tools.parametersObject"
+  | "settings.tools.duplicateName"
+  | "settings.tools.namedMissing"
+  | "settings.tools.choiceWithoutTools"
+  | "settings.tools.applyJson"
+  | "settings.auth.title"
+  | "settings.auth.advanced"
+  | "settings.auth.warning"
+  | "settings.auth.extraHeaders"
+  | "settings.auth.headerName"
+  | "settings.auth.headerValue"
+  | "settings.auth.addHeader"
+  | "settings.auth.removeHeader"
+  | "settings.auth.apiKeyQuery"
+  | "settings.auth.apiKeyQueryPlaceholder"
+  | "settings.auth.apiKeyQueryHint"
+  | "settings.auth.headersUnsupported"
+  | "settings.auth.queryUnsupported"
+  | "settings.auth.headerNameRequired"
+  | "settings.auth.headerCrlf"
+  | "settings.auth.queryInvalid"
   | "settings.default.updated"
   | "common.save"
   | "common.cancel"
@@ -151,6 +214,16 @@ const zhCN: Record<MessageKey, string> = {
   "chat.reasoning": "思考过程",
   "chat.stopped": "已停止",
   "chat.error": "生成失败",
+  "chat.toolCalls": "工具调用",
+  "chat.toolCallsReadonly": "仅展示，应用不会执行",
+  "chat.toolCallUnnamed": "未命名工具",
+  "chat.finishReason": "结束原因: {reason}",
+  "chat.retryAfter": "建议 {ms}ms 后重试",
+  "chat.attachImage": "添加图片",
+  "chat.removeImage": "移除图片",
+  "chat.pendingImages": "待发送图片",
+  "chat.imageAttachment": "图片",
+  "chat.visionUnsupported": "当前协议不支持图片输入",
   "chat.selectProvider": "选择服务商",
   "chat.selectModel": "选择模型",
   "chat.systemPrompt": "系统提示词",
@@ -234,6 +307,67 @@ const zhCN: Record<MessageKey, string> = {
   "settings.models.isDefault": "默认",
   "settings.models.discovering": "正在获取模型…",
   "settings.models.discoverFailed": "获取模型失败，已保留现有模型。",
+  "settings.reasoning.title": "推理强度 / 预算",
+  "settings.reasoning.mode": "请求侧推理策略",
+  "settings.reasoning.modeAuto": "自动（不传控制）",
+  "settings.reasoning.modeOff": "关闭",
+  "settings.reasoning.modeOn": "开启",
+  "settings.reasoning.effort": "effort",
+  "settings.reasoning.effortNone": "不指定",
+  "settings.reasoning.budget": "budget_tokens",
+  "settings.reasoning.budgetPlaceholder": "可选，正整数",
+  "settings.reasoning.requestVsResponse":
+    "此处为请求侧推理强度；聊天区「思考过程」为响应侧展示，互不替代。",
+  "settings.reasoning.hintChatCompletions":
+    "当前协议不支持请求侧推理控制；可改用 OpenAI Responses。响应侧「思考过程」仍可展示。",
+  "settings.reasoning.hintResponses":
+    "Responses 支持 effort（无 Max）；budget 通常会被忽略。",
+  "settings.reasoning.hintAnthropic":
+    "Anthropic 常用 budget_tokens（建议 ≥1024）；请注意与 max_tokens 的关系。",
+  "settings.reasoning.hintGemini":
+    "Gemini 支持 level/budget 路径；动态预算请使用「自动」。",
+  "settings.reasoning.hintGeneric": "按协议能力配置请求侧推理策略。",
+  "settings.reasoning.unsupportedControl": "当前协议不支持请求侧推理控制",
+  "settings.reasoning.budgetInvalid": "budget_tokens 须为正整数或留空",
+  "settings.tools.title": "工具定义（透传）",
+  "settings.tools.hint":
+    "仅随请求发送工具定义并展示模型工具调用，应用不会执行工具、不做多轮循环。",
+  "settings.tools.unsupported": "当前协议不支持 tools",
+  "settings.tools.jsonLabel": "tools JSON 数组",
+  "settings.tools.jsonPlaceholder":
+    '[\n  {\n    "name": "get_weather",\n    "description": "查询天气",\n    "parameters": { "type": "object", "properties": {} }\n  }\n]',
+  "settings.tools.toolChoice": "tool_choice",
+  "settings.tools.choiceAuto": "auto",
+  "settings.tools.choiceNone": "none",
+  "settings.tools.choiceRequired": "required",
+  "settings.tools.choiceNamed": "named",
+  "settings.tools.namedTool": "指定工具名",
+  "settings.tools.jsonInvalid": "tools JSON 无法解析",
+  "settings.tools.jsonMustBeArray": "tools 须为 JSON 数组",
+  "settings.tools.itemInvalid": "tools 数组元素无效",
+  "settings.tools.nameRequired": "tool name 不能为空",
+  "settings.tools.parametersObject": "tool parameters 必须是 JSON object",
+  "settings.tools.duplicateName": "tool name 重复: {name}",
+  "settings.tools.namedMissing": "tool_choice named 必须引用已声明的 tool",
+  "settings.tools.choiceWithoutTools": "未配置 tools 时不能设置 tool_choice",
+  "settings.tools.applyJson": "应用 JSON",
+  "settings.auth.title": "高级鉴权",
+  "settings.auth.advanced": "展开高级鉴权选项",
+  "settings.auth.warning":
+    "自定义请求头可能包含敏感信息；api_key 放入 query 可能被代理日志记录。请仅在确有需要时配置。",
+  "settings.auth.extraHeaders": "额外请求头",
+  "settings.auth.headerName": "Header 名",
+  "settings.auth.headerValue": "Header 值",
+  "settings.auth.addHeader": "添加 Header",
+  "settings.auth.removeHeader": "移除",
+  "settings.auth.apiKeyQuery": "API Key Query 参数名",
+  "settings.auth.apiKeyQueryPlaceholder": "例如 key（留空则不使用 query）",
+  "settings.auth.apiKeyQueryHint": "非空时将 API Key 作为该 query 参数发送（空 Key 则不发）",
+  "settings.auth.headersUnsupported": "当前协议不支持自定义请求头",
+  "settings.auth.queryUnsupported": "当前协议不支持 API Key query 参数",
+  "settings.auth.headerNameRequired": "Header 名不能为空",
+  "settings.auth.headerCrlf": "Header 名/值不能包含换行",
+  "settings.auth.queryInvalid": "api_key_query_param 包含非法字符",
   "settings.default.updated": "默认服务商与模型已更新",
   "common.save": "保存",
   "common.cancel": "取消",

@@ -49,6 +49,18 @@ pub fn logs_dir(root: &Path) -> PathBuf {
     root.join("logs")
 }
 
+pub fn attachments_dir(root: &Path) -> PathBuf {
+    root.join("attachments")
+}
+
+pub fn attachment_blob_path(root: &Path, attachment_id: Uuid) -> PathBuf {
+    attachments_dir(root).join(format!("{attachment_id}.bin"))
+}
+
+pub fn attachment_meta_path(root: &Path, attachment_id: Uuid) -> PathBuf {
+    attachments_dir(root).join(format!("{attachment_id}.json"))
+}
+
 pub fn session_dir(root: &Path, session_id: Uuid) -> PathBuf {
     sessions_dir(root).join(session_id.to_string())
 }

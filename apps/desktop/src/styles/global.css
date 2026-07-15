@@ -488,6 +488,92 @@ svg {
   word-break: break-word;
 }
 
+.mprism-tool-calls {
+  border: 1px solid var(--myui-color-border-light);
+  border-radius: var(--myui-radius-2);
+  padding: 8px 10px;
+  background: var(--myui-color-bg-inset);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mprism-tool-calls__title {
+  font-size: var(--myui-font-size-1);
+  color: var(--myui-color-text-secondary);
+}
+
+.mprism-tool-call summary {
+  cursor: pointer;
+  font-size: var(--myui-font-size-1);
+  color: var(--myui-color-text-secondary);
+}
+
+.mprism-tool-call__args {
+  margin: 6px 0 0;
+  padding: 8px;
+  overflow-x: auto;
+  border-radius: 6px;
+  background: var(--myui-color-bg-base);
+  border: 1px solid var(--myui-color-border-light);
+  font-family: var(--myui-font-family-mono);
+  font-size: var(--myui-font-size-1);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.mprism-assistant-foot {
+  font-size: var(--myui-font-size-1);
+}
+
+.mprism-pending-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 4px 8px;
+}
+
+.mprism-pending-attachment {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--myui-color-border-light);
+  background: var(--myui-color-bg-inset);
+}
+
+.mprism-pending-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.mprism-pending-attachment .myui-button {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background: color-mix(in srgb, var(--myui-color-bg-base) 80%, transparent);
+}
+
+.mprism-msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.mprism-msg-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: var(--myui-font-size-1);
+  background: color-mix(in srgb, var(--myui-color-bg-base) 70%, transparent);
+  border: 1px solid var(--myui-color-border-light);
+}
+
 .mprism-markdown {
   line-height: 1.55;
   word-break: break-word;

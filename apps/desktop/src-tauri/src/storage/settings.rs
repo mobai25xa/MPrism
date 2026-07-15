@@ -10,8 +10,9 @@ use super::atomic::{atomic_write_json, read_to_string};
 use super::error::{StorageError, StorageResult};
 use super::paths::{check_schema_version, settings_path, SCHEMA_VERSION};
 use super::types::{
-    char_len, normalize_stored_base_url, ModelRecord, ProviderRecord, SettingsDocument,
-    StoredProtocol, ThemePreference, MAX_PROVIDER_NAME_CHARS,
+    char_len, normalize_stored_base_url, validate_stored_auth, validate_stored_tools, ModelRecord,
+    ProviderRecord, SettingsDocument, StoredExtraHeader, StoredProtocol, StoredToolChoice,
+    StoredToolDefinition, ThemePreference, MAX_PROVIDER_NAME_CHARS,
 };
 
 /// Three-state API key update for upserts.
@@ -31,6 +32,10 @@ pub struct ProviderUpsert {
     pub base_url: String,
     pub api_key: ApiKeyUpdate,
     pub models: Vec<ModelRecord>,
+    pub tools: Vec<StoredToolDefinition>,
+    pub tool_choice: Option<StoredToolChoice>,
+    pub extra_headers: Vec<StoredExtraHeader>,
+    pub api_key_query_param: Option<String>,
 }
 
 impl std::fmt::Debug for ProviderUpsert {
@@ -49,6 +54,10 @@ impl std::fmt::Debug for ProviderUpsert {
                 },
             )
             .field("models", &self.models)
+            .field("tools_len", &self.tools.len())
+            .field("tool_choice", &self.tool_choice)
+            .field("extra_headers", &self.extra_headers)
+            .field("api_key_query_param", &self.api_key_query_param)
             .finish()
     }
 }
@@ -62,6 +71,14 @@ pub struct ProviderPublic {
     pub base_url: String,
     pub api_key_present: bool,
     pub models: Vec<ModelRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<StoredToolDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<StoredToolChoice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<StoredExtraHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_query_param: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -78,6 +95,10 @@ impl From<&ProviderRecord> for ProviderPublic {
             base_url: p.base_url.clone(),
             api_key_present: !p.api_key.is_empty(),
             models: p.models.clone(),
+            tools: p.tools.clone(),
+            tool_choice: p.tool_choice.clone(),
+            extra_headers: p.extra_headers.clone(),
+            api_key_query_param: p.api_key_query_param.clone(),
             created_at: p.created_at,
             updated_at: p.updated_at,
             revision: p.revision,
@@ -142,6 +163,25 @@ pub fn upsert_provider(
             )));
         }
     }
+    validate_stored_tools(&input.tools, input.tool_choice.as_ref())?;
+    // Validate before trimming so trailing CR/LF cannot be silently stripped.
+    validate_stored_auth(&input.extra_headers, input.api_key_query_param.as_deref())?;
+    let api_key_query_param = input
+        .api_key_query_param
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let extra_headers: Vec<StoredExtraHeader> = input
+        .extra_headers
+        .into_iter()
+        .map(|h| StoredExtraHeader {
+            name: h.name.trim().to_string(),
+            value: h.value,
+        })
+        .filter(|h| !h.name.is_empty() || !h.value.is_empty())
+        .collect();
+    // Re-validate after normalize (empty names filtered etc.).
+    validate_stored_auth(&extra_headers, api_key_query_param.as_deref())?;
 
     let now = OffsetDateTime::now_utc();
     let public = if let Some(id) = input.id {
@@ -160,6 +200,10 @@ pub fn upsert_provider(
             ApiKeyUpdate::Clear => existing.api_key.clear(),
         }
         existing.models = input.models;
+        existing.tools = input.tools;
+        existing.tool_choice = input.tool_choice;
+        existing.extra_headers = extra_headers;
+        existing.api_key_query_param = api_key_query_param;
         existing.updated_at = now;
         existing.revision = existing.revision.saturating_add(1);
         ProviderPublic::from(&*existing)
@@ -175,6 +219,10 @@ pub fn upsert_provider(
             base_url,
             api_key,
             models: input.models,
+            tools: input.tools,
+            tool_choice: input.tool_choice,
+            extra_headers,
+            api_key_query_param,
             created_at: now,
             updated_at: now,
             revision: 1,

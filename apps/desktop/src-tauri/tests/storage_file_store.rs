@@ -5,7 +5,7 @@ use std::fs;
 use mprism_desktop_lib::storage::{
     redact_log_message, ApiKeyUpdate, AssistantStatus, FileStore, MessageCorruption, MessageRecord,
     ModelRecord, ModelSnapshot, ModelSource, ProviderSnapshot, ProviderUpsert, SessionUpdate,
-    StoredProtocol, ThemePreference, TitleSource, DEFAULT_SESSION_TITLE,
+    StoredProtocol, StoredReasoningSettings, ThemePreference, TitleSource, DEFAULT_SESSION_TITLE,
 };
 use uuid::Uuid;
 
@@ -40,6 +40,7 @@ fn settings_theme_and_provider_upsert_key_states() {
         source: ModelSource::Discovery,
         temperature: Some(0.7),
         max_tokens: Some(1024),
+        reasoning: None,
     };
 
     let (doc, pubp) = store
@@ -50,6 +51,10 @@ fn settings_theme_and_provider_upsert_key_states() {
             base_url: "https://api.example.com/v1/".into(),
             api_key: ApiKeyUpdate::Replace("sk-secret-real-key-123".into()),
             models: vec![model.clone()],
+            tools: vec![],
+            tool_choice: None,
+            extra_headers: vec![],
+            api_key_query_param: None,
         })
         .unwrap();
 
@@ -67,6 +72,10 @@ fn settings_theme_and_provider_upsert_key_states() {
             base_url: "https://api.example.com/v1".into(),
             api_key: ApiKeyUpdate::Keep,
             models: vec![model.clone()],
+            tools: vec![],
+            tool_choice: None,
+            extra_headers: vec![],
+            api_key_query_param: None,
         })
         .unwrap();
     assert!(pub2.api_key_present);
@@ -81,6 +90,10 @@ fn settings_theme_and_provider_upsert_key_states() {
             base_url: "https://api.example.com/v1".into(),
             api_key: ApiKeyUpdate::Clear,
             models: vec![model],
+            tools: vec![],
+            tool_choice: None,
+            extra_headers: vec![],
+            api_key_query_param: None,
         })
         .unwrap();
     assert!(!pub3.api_key_present);
@@ -102,7 +115,12 @@ fn provider_debug_and_public_never_show_key() {
                 source: ModelSource::Manual,
                 temperature: None,
                 max_tokens: None,
+                reasoning: None,
             }],
+            tools: vec![],
+            tool_choice: None,
+            extra_headers: vec![],
+            api_key_query_param: None,
         })
         .unwrap();
     let dbg = format!("{pubp:?}");
@@ -121,6 +139,7 @@ fn delete_provider_repairs_defaults() {
         source: ModelSource::Manual,
         temperature: None,
         max_tokens: None,
+        reasoning: None,
     };
     let (_, a) = store
         .upsert_provider(ProviderUpsert {
@@ -130,6 +149,10 @@ fn delete_provider_repairs_defaults() {
             base_url: "https://a.example/v1".into(),
             api_key: ApiKeyUpdate::Clear,
             models: vec![model],
+            tools: vec![],
+            tool_choice: None,
+            extra_headers: vec![],
+            api_key_query_param: None,
         })
         .unwrap();
     let (_, b) = store
@@ -145,7 +168,12 @@ fn delete_provider_repairs_defaults() {
                 source: ModelSource::Manual,
                 temperature: None,
                 max_tokens: None,
+                reasoning: None,
             }],
+            tools: vec![],
+            tool_choice: None,
+            extra_headers: vec![],
+            api_key_query_param: None,
         })
         .unwrap();
     let doc = store.delete_provider(a.id).unwrap();
@@ -241,6 +269,7 @@ fn messages_unicode_append_and_load() {
         },
         None,
         Some("stop".into()),
+        vec![],
         None,
         store.device_id(),
     );
@@ -325,6 +354,10 @@ fn rejects_base_url_with_query() {
             base_url: "https://api.example.com/v1?x=1".into(),
             api_key: ApiKeyUpdate::Clear,
             models: vec![],
+            tools: vec![],
+            tool_choice: None,
+            extra_headers: vec![],
+            api_key_query_param: None,
         })
         .unwrap_err();
     let msg = err.to_string();
@@ -359,4 +392,195 @@ fn never_uses_real_user_mprism_in_tests() {
     let home_mprism = dirs::home_dir().unwrap().join(".mprism");
     assert_ne!(root, home_mprism);
     assert!(root.starts_with(dir.path()) || root == dir.path());
+}
+
+#[test]
+fn settings_roundtrip_reasoning_and_legacy_without_field() {
+    let (dir, store) = temp_store();
+    let model = ModelRecord {
+        id: "think-model".into(),
+        display_name: "Think".into(),
+        source: ModelSource::Manual,
+        temperature: None,
+        max_tokens: None,
+        reasoning: Some(StoredReasoningSettings {
+            mode: "on".into(),
+            effort: Some("medium".into()),
+            budget_tokens: Some(2048),
+        }),
+    };
+    let (_, pubp) = store
+        .upsert_provider(ProviderUpsert {
+            id: None,
+            name: "R".into(),
+            protocol: StoredProtocol::OpenAiResponses,
+            base_url: "https://api.example.com/v1".into(),
+            api_key: ApiKeyUpdate::Replace("sk-test".into()),
+            models: vec![model],
+            tools: vec![],
+            tool_choice: None,
+            extra_headers: vec![],
+            api_key_query_param: None,
+        })
+        .unwrap();
+    let reloaded = store.load_settings().unwrap();
+    let saved = &reloaded.providers[0].models[0];
+    let reasoning = saved.reasoning.as_ref().expect("reasoning stored");
+    assert_eq!(reasoning.mode, "on");
+    assert_eq!(reasoning.effort.as_deref(), Some("medium"));
+    assert_eq!(reasoning.budget_tokens, Some(2048));
+    assert_eq!(pubp.models[0].reasoning.as_ref().unwrap().mode, "on");
+
+    // Legacy settings without reasoning field still load (serde default).
+    let legacy = r#"{
+      "schema_version": 1,
+      "theme": "system",
+      "default_provider_id": null,
+      "default_model_id": null,
+      "providers": [{
+        "id": "018f0000-0000-7000-8000-000000000001",
+        "name": "Legacy",
+        "protocol": "openai_chat_completions",
+        "base_url": "https://legacy.example/v1",
+        "api_key": "",
+        "models": [{
+          "id": "m",
+          "display_name": "M",
+          "source": "manual",
+          "temperature": null,
+          "max_tokens": null
+        }],
+        "created_at": "2026-07-11T00:00:00Z",
+        "updated_at": "2026-07-11T00:00:00Z",
+        "revision": 1
+      }],
+      "updated_at": "2026-07-11T00:00:00Z",
+      "revision": 1
+    }"#;
+    fs::write(dir.path().join("settings.json"), legacy).unwrap();
+    let legacy_doc = store.load_settings().unwrap();
+    assert!(legacy_doc.providers[0].models[0].reasoning.is_none());
+}
+
+#[test]
+fn provider_tools_persist_and_validate() {
+    use mprism_desktop_lib::storage::{StoredToolChoice, StoredToolDefinition};
+
+    let (_dir, store) = temp_store();
+    let tools = vec![StoredToolDefinition {
+        name: "get_weather".into(),
+        description: Some("weather".into()),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    }];
+    let (_doc, pubp) = store
+        .upsert_provider(ProviderUpsert {
+            id: None,
+            name: "Tools Provider".into(),
+            protocol: StoredProtocol::OpenAiChatCompletions,
+            base_url: "https://api.example.com/v1".into(),
+            api_key: ApiKeyUpdate::Replace("sk".into()),
+            models: vec![ModelRecord {
+                id: "m1".into(),
+                display_name: "M1".into(),
+                source: ModelSource::Manual,
+                temperature: None,
+                max_tokens: None,
+                reasoning: None,
+            }],
+            tools: tools.clone(),
+            tool_choice: Some(StoredToolChoice {
+                mode: "named".into(),
+                name: Some("get_weather".into()),
+            }),
+            extra_headers: vec![],
+            api_key_query_param: None,
+        })
+        .unwrap();
+    assert_eq!(pubp.tools.len(), 1);
+    assert_eq!(pubp.tools[0].name, "get_weather");
+    assert_eq!(pubp.tool_choice.as_ref().unwrap().mode, "named");
+
+    let reloaded = store.load_settings().unwrap();
+    let p = reloaded.providers.iter().find(|x| x.id == pubp.id).unwrap();
+    assert_eq!(p.tools.len(), 1);
+
+    let err = store
+        .upsert_provider(ProviderUpsert {
+            id: Some(pubp.id),
+            name: "Tools Provider".into(),
+            protocol: StoredProtocol::OpenAiChatCompletions,
+            base_url: "https://api.example.com/v1".into(),
+            api_key: ApiKeyUpdate::Keep,
+            models: p.models.clone(),
+            tools,
+            tool_choice: Some(StoredToolChoice {
+                mode: "named".into(),
+                name: Some("missing_tool".into()),
+            }),
+            extra_headers: vec![],
+            api_key_query_param: None,
+        })
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("未声明") || msg.contains("named") || msg.contains("tool"));
+}
+
+#[test]
+fn provider_auth_options_persist_and_validate() {
+    use mprism_desktop_lib::storage::StoredExtraHeader;
+
+    let (_dir, store) = temp_store();
+    let (_doc, pubp) = store
+        .upsert_provider(ProviderUpsert {
+            id: None,
+            name: "Auth Provider".into(),
+            protocol: StoredProtocol::OpenAiChatCompletions,
+            base_url: "https://api.example.com/v1".into(),
+            api_key: ApiKeyUpdate::Replace("sk".into()),
+            models: vec![ModelRecord {
+                id: "m1".into(),
+                display_name: "M1".into(),
+                source: ModelSource::Manual,
+                temperature: None,
+                max_tokens: None,
+                reasoning: None,
+            }],
+            tools: vec![],
+            tool_choice: None,
+            extra_headers: vec![StoredExtraHeader {
+                name: "X-Org".into(),
+                value: "secret-header-value".into(),
+            }],
+            api_key_query_param: Some("key".into()),
+        })
+        .unwrap();
+    assert_eq!(pubp.extra_headers.len(), 1);
+    assert_eq!(pubp.extra_headers[0].name, "X-Org");
+    assert_eq!(pubp.api_key_query_param.as_deref(), Some("key"));
+    let dbg = format!("{:?}", pubp.extra_headers);
+    assert!(dbg.contains("***"));
+    assert!(!dbg.contains("secret-header-value"));
+
+    let reloaded = store.load_settings().unwrap();
+    let p = reloaded.providers.iter().find(|x| x.id == pubp.id).unwrap();
+    assert_eq!(p.extra_headers[0].value, "secret-header-value");
+
+    let err = store
+        .upsert_provider(ProviderUpsert {
+            id: Some(pubp.id),
+            name: "Auth Provider".into(),
+            protocol: StoredProtocol::OpenAiChatCompletions,
+            base_url: "https://api.example.com/v1".into(),
+            api_key: ApiKeyUpdate::Keep,
+            models: p.models.clone(),
+            tools: vec![],
+            tool_choice: None,
+            extra_headers: vec![StoredExtraHeader {
+                name: "X-Bad\n".into(),
+                value: "v".into(),
+            }],
+            api_key_query_param: None,
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("CR/LF") || err.to_string().contains("extra_headers"));
 }

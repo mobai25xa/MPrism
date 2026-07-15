@@ -2,13 +2,16 @@ use tauri::ipc::Channel;
 use tauri::State;
 use uuid::Uuid;
 
+use crate::application::check_ipc_schema;
 use crate::application::{
-    AppError, BootstrapPayload, CancelChatPayload, ChatInput, LoadedSession, ModelInfoPayload,
-    ProviderDraft, ProviderInput, StreamEnvelope, StreamSink, UnitPayload, UpdateSessionInput,
-    IPC_SCHEMA_VERSION,
+    AppError, BootstrapPayload, CancelChatPayload, ChatInput, ImportAttachmentInput, LoadedSession,
+    ModelInfoPayload, ProtocolCapabilitiesPayload, ProviderDraft, ProviderInput, StreamEnvelope,
+    StreamSink, UnitPayload, UpdateSessionInput, IPC_SCHEMA_VERSION,
 };
 use crate::state::AppState;
-use crate::storage::{MessageRecord, ProviderPublic, SessionMeta, ThemePreference};
+use crate::storage::{
+    AttachmentPublic, MessageRecord, ProviderPublic, SessionMeta, ThemePreference,
+};
 
 #[tauri::command]
 pub fn bootstrap(state: State<'_, AppState>) -> Result<BootstrapPayload, AppError> {
@@ -71,6 +74,21 @@ pub async fn discover_models(
 }
 
 #[tauri::command]
+pub fn list_protocol_capabilities(
+    state: State<'_, AppState>,
+) -> Result<Vec<ProtocolCapabilitiesPayload>, AppError> {
+    Ok(state.providers.list_protocol_capabilities())
+}
+
+#[tauri::command]
+pub fn get_protocol_capabilities(
+    state: State<'_, AppState>,
+    protocol: String,
+) -> Result<ProtocolCapabilitiesPayload, AppError> {
+    state.providers.protocol_capabilities(&protocol)
+}
+
+#[tauri::command]
 pub fn create_session(
     state: State<'_, AppState>,
     title: Option<String>,
@@ -121,6 +139,18 @@ impl StreamSink for ChannelSink {
             .send(envelope)
             .map_err(|_| AppError::cancelled())
     }
+}
+
+#[tauri::command]
+pub fn import_attachment(
+    state: State<'_, AppState>,
+    input: ImportAttachmentInput,
+) -> Result<AttachmentPublic, AppError> {
+    check_ipc_schema(input.schema_version)?;
+    state
+        .store
+        .import_attachment(&input.bytes, &input.media_type, input.original_name)
+        .map_err(AppError::from)
 }
 
 #[tauri::command]

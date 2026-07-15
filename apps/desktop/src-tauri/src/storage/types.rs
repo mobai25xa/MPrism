@@ -104,6 +104,210 @@ impl Default for DeviceDocument {
     }
 }
 
+/// Request-side reasoning settings stored on a model (omit / mode auto ≡ V1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StoredReasoningSettings {
+    /// `auto` | `off` | `on`
+    #[serde(default = "default_reasoning_mode")]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
+}
+
+fn default_reasoning_mode() -> String {
+    "auto".into()
+}
+
+impl StoredReasoningSettings {
+    pub fn is_effective_none(&self) -> bool {
+        matches!(self.mode.trim().to_ascii_lowercase().as_str(), "auto" | "")
+            && self.effort.is_none()
+            && self.budget_tokens.is_none()
+    }
+
+    pub fn validate(&self) -> StorageResult<()> {
+        match self.mode.trim().to_ascii_lowercase().as_str() {
+            "auto" | "off" | "on" => {}
+            other => {
+                return Err(StorageError::validation(format!(
+                    "reasoning.mode 须为 auto/off/on，收到: {other}"
+                )));
+            }
+        }
+        if let Some(effort) = self
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            match effort.to_ascii_lowercase().as_str() {
+                "minimal" | "low" | "medium" | "high" | "xhigh" | "x_high" | "max" => {}
+                other => {
+                    return Err(StorageError::validation(format!(
+                        "reasoning.effort 无效: {other}"
+                    )));
+                }
+            }
+        }
+        if let Some(budget) = self.budget_tokens {
+            if budget == 0 {
+                return Err(StorageError::validation(
+                    "reasoning.budget_tokens 必须为正整数或为空",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Provider-level tool definition (wire passthrough only; app does not execute).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredToolDefinition {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON Schema object (must be object at validate time).
+    pub parameters: serde_json::Value,
+}
+
+impl StoredToolDefinition {
+    pub fn validate(&self) -> StorageResult<()> {
+        if self.name.trim().is_empty() {
+            return Err(StorageError::validation("tool name 不能为空"));
+        }
+        if !self.parameters.is_object() {
+            return Err(StorageError::validation(
+                "tool parameters 必须是 JSON object",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Provider-level tool_choice. Absent / auto with empty tools ≡ V1 (no tools wire).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StoredToolChoice {
+    /// `auto` | `none` | `required` | `named`
+    #[serde(default = "default_tool_choice_mode")]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+fn default_tool_choice_mode() -> String {
+    "auto".into()
+}
+
+impl StoredToolChoice {
+    pub fn validate(&self, tool_names: &std::collections::HashSet<String>) -> StorageResult<()> {
+        match self.mode.trim().to_ascii_lowercase().as_str() {
+            "auto" | "none" | "required" => Ok(()),
+            "named" => {
+                let name = self
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| StorageError::validation("tool_choice named 必须提供 name"))?;
+                if !tool_names.contains(name) {
+                    return Err(StorageError::validation(format!(
+                        "tool_choice named 引用了未声明的 tool: {name}"
+                    )));
+                }
+                Ok(())
+            }
+            other => Err(StorageError::validation(format!(
+                "tool_choice.mode 须为 auto/none/required/named，收到: {other}"
+            ))),
+        }
+    }
+}
+
+/// Validate tools list + choice together (SDK-aligned).
+pub fn validate_stored_tools(
+    tools: &[StoredToolDefinition],
+    tool_choice: Option<&StoredToolChoice>,
+) -> StorageResult<()> {
+    if tools.is_empty() {
+        if tool_choice.is_some() {
+            return Err(StorageError::validation(
+                "未配置 tools 时不能设置 tool_choice",
+            ));
+        }
+        return Ok(());
+    }
+    let mut names = std::collections::HashSet::new();
+    for tool in tools {
+        tool.validate()?;
+        let name = tool.name.trim().to_string();
+        if !names.insert(name.clone()) {
+            return Err(StorageError::validation(format!("tool name 重复: {name}")));
+        }
+    }
+    if let Some(choice) = tool_choice {
+        choice.validate(&names)?;
+    }
+    Ok(())
+}
+
+/// Extra HTTP header stored on provider (value redacted in Debug).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredExtraHeader {
+    pub name: String,
+    pub value: String,
+}
+
+impl fmt::Debug for StoredExtraHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredExtraHeader")
+            .field("name", &self.name)
+            .field("value", &"***")
+            .finish()
+    }
+}
+
+impl StoredExtraHeader {
+    pub fn validate(&self) -> StorageResult<()> {
+        // Check CR/LF on raw input before trim (trailing newlines must not pass).
+        if self.name.chars().any(|c| c == '\r' || c == '\n') {
+            return Err(StorageError::validation("extra_headers 名称不能包含 CR/LF"));
+        }
+        if self.value.chars().any(|c| c == '\r' || c == '\n') {
+            return Err(StorageError::validation("extra_headers 值不能包含 CR/LF"));
+        }
+        if self.name.trim().is_empty() {
+            return Err(StorageError::validation("extra_headers 名称不能为空"));
+        }
+        Ok(())
+    }
+}
+
+/// Validate provider auth extensions (SDK AuthOptions-aligned).
+pub fn validate_stored_auth(
+    extra_headers: &[StoredExtraHeader],
+    api_key_query_param: Option<&str>,
+) -> StorageResult<()> {
+    for header in extra_headers {
+        header.validate()?;
+    }
+    if let Some(param) = api_key_query_param {
+        if param
+            .chars()
+            .any(|c| c == '\r' || c == '\n' || c == '=' || c == '&')
+        {
+            return Err(StorageError::validation("api_key_query_param 包含非法字符"));
+        }
+        if param.trim().is_empty() {
+            return Err(StorageError::validation(
+                "api_key_query_param 不能为空字符串（可省略）",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ModelRecord {
     pub id: String,
@@ -113,6 +317,9 @@ pub struct ModelRecord {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Model-level reasoning policy; absent on old settings ≡ auto/None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<StoredReasoningSettings>,
 }
 
 impl fmt::Debug for ModelRecord {
@@ -123,6 +330,7 @@ impl fmt::Debug for ModelRecord {
             .field("source", &self.source)
             .field("temperature", &self.temperature)
             .field("max_tokens", &self.max_tokens)
+            .field("reasoning", &self.reasoning)
             .finish()
     }
 }
@@ -147,6 +355,9 @@ impl ModelRecord {
                 return Err(StorageError::validation("max_tokens 必须为正整数或为空"));
             }
         }
+        if let Some(reasoning) = &self.reasoning {
+            reasoning.validate()?;
+        }
         Ok(())
     }
 }
@@ -159,6 +370,16 @@ pub struct ProviderRecord {
     pub base_url: String,
     pub api_key: String,
     pub models: Vec<ModelRecord>,
+    /// Provider-level tools (3.6); empty ≡ V1 no tools wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<StoredToolDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<StoredToolChoice>,
+    /// Provider-level AuthOptions (3.7); empty ≡ V1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<StoredExtraHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_query_param: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -182,6 +403,10 @@ impl fmt::Debug for ProviderRecord {
                 },
             )
             .field("models", &self.models)
+            .field("tools_len", &self.tools.len())
+            .field("tool_choice", &self.tool_choice)
+            .field("extra_headers", &self.extra_headers)
+            .field("api_key_query_param", &self.api_key_query_param)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .field("revision", &self.revision)
@@ -372,6 +597,10 @@ pub struct TokenUsageRecord {
     pub completion_tokens: Option<u32>,
     #[serde(default)]
     pub total_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,6 +612,27 @@ pub struct MessageErrorRecord {
     pub http_status: Option<u16>,
     #[serde(default)]
     pub provider_request_id: Option<String>,
+    /// Optional Retry-After from provider (ms). UI may surface only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+}
+
+/// Persisted tool call snapshot (display only; app does not execute).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+}
+
+/// Message-side attachment reference (blob lives under attachments/).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageAttachmentRef {
+    pub attachment_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -407,6 +657,12 @@ pub struct MessageRecord {
     pub usage: Option<TokenUsageRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// Tool calls observed in stream (3.4+); empty on legacy messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<StoredToolCall>,
+    /// Image attachment refs (3.5+); never stores base64 inline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachmentRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<MessageErrorRecord>,
     pub created_by_device_id: Uuid,
@@ -440,6 +696,8 @@ impl fmt::Debug for MessageRecord {
             .field("model", &self.model)
             .field("usage", &self.usage)
             .field("finish_reason", &self.finish_reason)
+            .field("tool_calls_len", &self.tool_calls.len())
+            .field("attachments_len", &self.attachments.len())
             .field("error", &self.error)
             .field("created_by_device_id", &self.created_by_device_id)
             .field("created_at", &self.created_at)
@@ -455,9 +713,19 @@ impl MessageRecord {
         content: impl Into<String>,
         device_id: Uuid,
     ) -> StorageResult<Self> {
+        Self::new_user_with_attachments(session_id, sequence, content, Vec::new(), device_id)
+    }
+
+    pub fn new_user_with_attachments(
+        session_id: Uuid,
+        sequence: u64,
+        content: impl Into<String>,
+        attachments: Vec<MessageAttachmentRef>,
+        device_id: Uuid,
+    ) -> StorageResult<Self> {
         let content = content.into();
         let trimmed = content.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && attachments.is_empty() {
             return Err(StorageError::validation("用户消息不能为空"));
         }
         if trimmed.chars().count() > MAX_USER_CONTENT_CHARS {
@@ -479,6 +747,8 @@ impl MessageRecord {
             model: None,
             usage: None,
             finish_reason: None,
+            tool_calls: Vec::new(),
+            attachments,
             error: None,
             created_by_device_id: device_id,
             created_at: now_utc(),
@@ -498,6 +768,7 @@ impl MessageRecord {
         model: ModelSnapshot,
         usage: Option<TokenUsageRecord>,
         finish_reason: Option<String>,
+        tool_calls: Vec<StoredToolCall>,
         error: Option<MessageErrorRecord>,
         device_id: Uuid,
     ) -> Self {
@@ -516,6 +787,8 @@ impl MessageRecord {
             model: Some(model),
             usage,
             finish_reason,
+            tool_calls,
+            attachments: Vec::new(),
             error,
             created_by_device_id: device_id,
             created_at: now_utc(),

@@ -8,7 +8,12 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { t } from "../../i18n";
 import { useAppStore, resolveSelection, streamingAssistantMessage } from "../../app/store";
 import type { MessageRecord, SessionMeta } from "../../lib/types";
-import { relativeTime, shouldSendOnEnter } from "./streamReducer";
+import {
+  formatFinishReason,
+  formatTokenUsage,
+  relativeTime,
+  shouldSendOnEnter,
+} from "./streamReducer";
 import {
   Alert,
   Button,
@@ -19,6 +24,8 @@ import {
   IconChevronLeft,
   IconChevronRight,
   IconDoc,
+  IconDismiss,
+  IconImage,
   IconPlus,
   IconRename,
   IconSend,
@@ -153,7 +160,11 @@ function TypingDots() {
 
 function AssistantBody({ message, streaming }: { message: MessageRecord; streaming: boolean }) {
   const open = streaming && !!(message.reasoning && message.reasoning.length > 0);
-  const showTyping = streaming && !message.content;
+  const showTyping = streaming && !message.content && !(message.tool_calls?.length);
+  const usageLine = formatTokenUsage(message.usage);
+  const finishLabel = formatFinishReason(message.finish_reason);
+  const toolCalls = message.tool_calls ?? [];
+  const retryAfter = message.error?.retry_after_ms;
   return (
     <div className="mprism-assistant">
       <div className="mprism-assistant-meta">{message.model?.display_name ?? "assistant"}</div>
@@ -162,6 +173,27 @@ function AssistantBody({ message, streaming }: { message: MessageRecord; streami
           <summary>{t("chat.reasoning")}</summary>
           <div className="mprism-reasoning-body">{message.reasoning}</div>
         </details>
+      )}
+      {toolCalls.length > 0 && (
+        <div className="mprism-tool-calls" aria-label={t("chat.toolCalls")}>
+          <div className="mprism-tool-calls__title">
+            {t("chat.toolCalls")}
+            <span className="mprism-muted"> · {t("chat.toolCallsReadonly")}</span>
+          </div>
+          {toolCalls.map((call, index) => (
+            <details
+              key={`${call.id || "tool"}-${call.index ?? index}`}
+              className="mprism-tool-call"
+              open={streaming || undefined}
+            >
+              <summary>
+                {call.name || t("chat.toolCallUnnamed")}
+                {call.id ? <span className="mprism-muted"> · {call.id}</span> : null}
+              </summary>
+              <pre className="mprism-tool-call__args">{call.arguments || "{}"}</pre>
+            </details>
+          ))}
+        </div>
       )}
       {showTyping ? (
         <TypingDots />
@@ -209,12 +241,24 @@ function AssistantBody({ message, streaming }: { message: MessageRecord; streami
           </ReactMarkdown>
         </div>
       ) : null}
+      {(usageLine || (finishLabel && message.status === "completed")) && (
+        <div className="mprism-assistant-foot mprism-muted">
+          {usageLine}
+          {usageLine && finishLabel && message.status === "completed" ? " · " : null}
+          {finishLabel && message.status === "completed"
+            ? t("chat.finishReason", { reason: finishLabel })
+            : null}
+        </div>
+      )}
       {message.status === "stopped" && (
         <div className="mprism-muted">{t("chat.stopped")}</div>
       )}
       {message.status === "error" && (
         <Alert type="error">
           {t("chat.error")}: {message.error?.message ?? ""}
+          {retryAfter != null && retryAfter > 0
+            ? ` (${t("chat.retryAfter", { ms: retryAfter })})`
+            : ""}
         </Alert>
       )}
     </div>
@@ -319,6 +363,8 @@ export function ChatWorkspace() {
   const messagesBySession = useAppStore((s) => s.messagesBySession);
   const generations = useAppStore((s) => s.generations);
   const draftsBySession = useAppStore((s) => s.draftsBySession);
+  const pendingAttachmentsBySession = useAppStore((s) => s.pendingAttachmentsBySession);
+  const protocolCapabilities = useAppStore((s) => s.protocolCapabilities);
   const defaultProviderId = useAppStore((s) => s.defaultProviderId);
   const defaultModelId = useAppStore((s) => s.defaultModelId);
   const chatLoading = useAppStore((s) => s.chatLoading);
@@ -331,13 +377,18 @@ export function ChatWorkspace() {
   const updateSystemPrompt = useAppStore((s) => s.updateSystemPrompt);
   const updateSessionSelection = useAppStore((s) => s.updateSessionSelection);
   const setComposerDraft = useAppStore((s) => s.setComposerDraft);
+  const addPendingAttachment = useAppStore((s) => s.addPendingAttachment);
+  const removePendingAttachment = useAppStore((s) => s.removePendingAttachment);
   const sendMessage = useAppStore((s) => s.sendMessage);
   const stopGeneration = useAppStore((s) => s.stopGeneration);
+  const ensureProtocolCapabilities = useAppStore((s) => s.ensureProtocolCapabilities);
 
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [promptOpen, setPromptOpen] = useState(false);
   const [promptDraft, setPromptDraft] = useState("");
   const [stickToBottom, setStickToBottom] = useState(true);
+  const [importingImage, setImportingImage] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const anchorRailRef = useRef<HTMLDivElement | null>(null);
   const outlineTipHideTimerRef = useRef<number | null>(null);
@@ -495,12 +546,25 @@ export function ChatWorkspace() {
   }, []);
 
   const draft = activeSessionId ? draftsBySession[activeSessionId] ?? "" : "";
+  const pendingAttachments = activeSessionId
+    ? pendingAttachmentsBySession[activeSessionId] ?? []
+    : [];
+  const selectedProvider = providers.find((p) => p.id === selection.providerId) ?? null;
+  const visionInput =
+    protocolCapabilities[selectedProvider?.protocol ?? ""]?.vision_input ?? true;
   const canSend =
     !!activeSessionId &&
     !!selection.providerId &&
     !!selection.modelId &&
-    draft.trim().length > 0 &&
-    !generation;
+    (draft.trim().length > 0 || pendingAttachments.length > 0) &&
+    !generation &&
+    !importingImage;
+
+  useEffect(() => {
+    if (selectedProvider?.protocol) {
+      void ensureProtocolCapabilities(selectedProvider.protocol);
+    }
+  }, [selectedProvider?.protocol, ensureProtocolCapabilities]);
 
   const updateActiveAnchor = () => {
     const container = listRef.current;
@@ -791,6 +855,20 @@ export function ChatWorkspace() {
                           data-anchor-id={message.id}
                         >
                           {message.content}
+                          {!!message.attachments?.length && (
+                            <div className="mprism-msg-attachments">
+                              {message.attachments.map((att) => (
+                                <span
+                                  key={att.attachment_id}
+                                  className="mprism-msg-attachment-chip"
+                                  title={att.attachment_id}
+                                >
+                                  {t("chat.imageAttachment")}
+                                  {att.media_type ? ` · ${att.media_type}` : ""}
+                                </span>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       ) : (
                         <AssistantBody
@@ -916,6 +994,32 @@ export function ChatWorkspace() {
 
             <div className="mprism-composer-wrap">
               <div className="mprism-composer-box">
+                {pendingAttachments.length > 0 && (
+                  <div className="mprism-pending-attachments" aria-label={t("chat.pendingImages")}>
+                    {pendingAttachments.map((item) => (
+                      <div key={item.localId} className="mprism-pending-attachment">
+                        <img src={item.previewUrl} alt="" className="mprism-pending-thumb" />
+                        <Tooltip content={t("chat.removeImage")} placement="top">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            icon={<IconDismiss size={14} />}
+                            aria-label={t("chat.removeImage")}
+                            disabled={!!generation}
+                            onClick={() =>
+                              removePendingAttachment(activeSession.id, item.localId)
+                            }
+                          />
+                        </Tooltip>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {!visionInput && (
+                  <div className="mprism-muted" style={{ fontSize: "var(--myui-font-size-1)" }}>
+                    {t("chat.visionUnsupported")}
+                  </div>
+                )}
                 <Textarea
                   className="mprism-textarea"
                   placeholder={t("chat.composerPlaceholder")}
@@ -929,6 +1033,30 @@ export function ChatWorkspace() {
                         void sendMessage(activeSession.id, draft);
                       }
                     }
+                  }}
+                />
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/gif"
+                  multiple
+                  hidden
+                  onChange={(event) => {
+                    const files = event.target.files;
+                    event.target.value = "";
+                    if (!files || files.length === 0 || !activeSessionId) {
+                      return;
+                    }
+                    setImportingImage(true);
+                    void (async () => {
+                      try {
+                        for (const file of Array.from(files)) {
+                          await addPendingAttachment(activeSessionId, file);
+                        }
+                      } finally {
+                        setImportingImage(false);
+                      }
+                    })();
                   }}
                 />
                 <div className="mprism-composer-toolbar">
@@ -960,6 +1088,27 @@ export function ChatWorkspace() {
                       );
                     }}
                   />
+                  <Tooltip
+                    content={
+                      visionInput ? t("chat.attachImage") : t("chat.visionUnsupported")
+                    }
+                    placement="top"
+                  >
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      icon={<IconImage size={14} />}
+                      aria-label={t("chat.attachImage")}
+                      disabled={
+                        !visionInput ||
+                        !!generation ||
+                        importingImage ||
+                        !selection.providerId ||
+                        !selection.modelId
+                      }
+                      onClick={() => fileInputRef.current?.click()}
+                    />
+                  </Tooltip>
                   <div className="mprism-composer-spacer" />
                   {generation ? (
                     <Button

@@ -208,6 +208,91 @@ describe("chat workspace mock IPC", () => {
     expect(useAppStore.getState().generations.s1).toBeUndefined();
   });
 
+  it("sends model stored reasoning on start_chat and omits auto", async () => {
+    const s1 = session("s1");
+    const invoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "bootstrap") {
+        return {
+          ...bootstrapPayload([s1]),
+          providers: [
+            {
+              ...provider(),
+              protocol: "openai_responses",
+              models: [
+                {
+                  id: "m1",
+                  display_name: "Model",
+                  source: "manual",
+                  temperature: null,
+                  max_tokens: null,
+                  reasoning: { mode: "on", effort: "low", budget_tokens: 1024 },
+                },
+              ],
+            },
+          ],
+        } satisfies BootstrapPayload;
+      }
+      if (cmd === "list_protocol_capabilities") {
+        return [
+          {
+            protocol: "openai_responses",
+            streaming: true,
+            list_models: true,
+            reasoning_output: true,
+            reasoning_control: true,
+            tools: true,
+            vision_input: true,
+            stream_usage: true,
+            custom_headers: true,
+            api_key_query: true,
+          },
+        ];
+      }
+      if (cmd === "load_session") {
+        return {
+          schema_version: 1,
+          meta: s1,
+          messages: [],
+          partially_corrupt: false,
+        } satisfies LoadedSession;
+      }
+      if (cmd === "start_chat") {
+        const input = args?.input as { reasoning?: unknown };
+        expect(input.reasoning).toEqual({
+          mode: "on",
+          effort: "low",
+          budget_tokens: 1024,
+        });
+        return {
+          schema_version: 1,
+          id: "a1",
+          session_id: "s1",
+          sequence: 2,
+          role: "assistant",
+          content: "ok",
+          status: "completed",
+          created_by_device_id: "d1",
+          created_at: "2026-07-11T00:00:02Z",
+        } satisfies MessageRecord;
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    setTauriBridge({
+      invoke: invoke as never,
+      channel: (onMessage) => ({ onmessage: onMessage, id: 1 }),
+    });
+    await useAppStore.getState().bootstrap();
+    await useAppStore.getState().sendMessage("s1", "hi");
+    expect(invoke).toHaveBeenCalledWith(
+      "start_chat",
+      expect.objectContaining({
+        input: expect.objectContaining({
+          reasoning: { mode: "on", effort: "low", budget_tokens: 1024 },
+        }),
+      }),
+    );
+  });
+
   it("keeps two session generation maps independent", async () => {
     setTauriBridge({
       invoke: (async (cmd: string) => {
@@ -235,6 +320,7 @@ describe("chat workspace mock IPC", () => {
           nextSequence: 1,
           reasoning: "",
           content: "one",
+          toolCalls: [],
           phase: "streaming",
         },
         s2: {
@@ -244,6 +330,7 @@ describe("chat workspace mock IPC", () => {
           nextSequence: 1,
           reasoning: "",
           content: "two",
+          toolCalls: [],
           phase: "streaming",
         },
       },

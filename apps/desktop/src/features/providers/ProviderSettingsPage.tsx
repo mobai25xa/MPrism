@@ -19,13 +19,33 @@ import {
   Input,
   Modal,
   Select,
+  Textarea,
   Tooltip,
   cx,
 } from "../../ui";
 import { t } from "../../i18n";
-import type { ModelInfoPayload, ModelRecord, ProviderPublic } from "../../lib/types";
+import type {
+  ModelInfoPayload,
+  ModelRecord,
+  ProviderPublic,
+  ReasoningEffortId,
+  ReasoningModeId,
+  StoredReasoningSettings,
+  ToolChoiceModeId,
+} from "../../lib/types";
 import { useAppStore } from "../../app/store";
-import { validateProviderDraft } from "./formLogic";
+import {
+  normalizeReasoningMode,
+  normalizeStoredReasoning,
+  normalizeToolChoiceMode,
+  parseToolsJsonText,
+  toolsToJsonText,
+  protocolReasoningHint,
+  validateAuthSettings,
+  validateProviderDraft,
+  validateReasoningSettings,
+  validateToolsSettings,
+} from "./formLogic";
 
 const SIDEBAR_COLLAPSED_KEY = "mprism.settings.sidebarCollapsed";
 const SIDEBAR_WIDTH_KEY = "mprism.settings.sidebarWidth";
@@ -89,6 +109,7 @@ export function ProviderSettingsPage() {
     modelSearch,
     defaultProviderId,
     defaultModelId,
+    protocolCapabilities,
     startDraft,
     selectProvider,
     updateDraft,
@@ -100,6 +121,7 @@ export function ProviderSettingsPage() {
     setDefaults,
     setFormError,
     markClean,
+    ensureProtocolCapabilities,
   } = useAppStore();
 
   const [unsavedOpen, setUnsavedOpen] = useState(false);
@@ -118,6 +140,34 @@ export function ProviderSettingsPage() {
     setSidebarCollapsed(collapsed);
     writeSidebarCollapsed(collapsed);
   };
+
+  useEffect(() => {
+    if (!draft?.protocol) {
+      return;
+    }
+    void ensureProtocolCapabilities(draft.protocol);
+  }, [draft?.protocol, ensureProtocolCapabilities]);
+
+  const reasoningControl =
+    protocolCapabilities[draft?.protocol ?? ""]?.reasoning_control ?? false;
+  const toolsSupported = protocolCapabilities[draft?.protocol ?? ""]?.tools ?? false;
+  const customHeadersSupported =
+    protocolCapabilities[draft?.protocol ?? ""]?.custom_headers ?? false;
+  const apiKeyQuerySupported =
+    protocolCapabilities[draft?.protocol ?? ""]?.api_key_query ?? false;
+  const [toolsJsonText, setToolsJsonText] = useState("");
+  const [toolsJsonError, setToolsJsonError] = useState<string | null>(null);
+  const [authOpen, setAuthOpen] = useState(false);
+
+  useEffect(() => {
+    if (!draft) {
+      setToolsJsonText("");
+      setToolsJsonError(null);
+      return;
+    }
+    setToolsJsonText(toolsToJsonText(draft.tools));
+    setToolsJsonError(null);
+  }, [draft?.name, draft?.protocol, selectedProviderId, draft?.tools]);
 
   useEffect(() => {
     const onMove = (event: PointerEvent) => {
@@ -217,6 +267,30 @@ export function ProviderSettingsPage() {
       setFormError(validationMessage);
       return false;
     }
+    for (const model of draft.models) {
+      const reasoningError = validateReasoningSettings(model.reasoning, {
+        reasoningControl,
+      });
+      if (reasoningError) {
+        setFormError(`${model.id}: ${reasoningError.message}`);
+        return false;
+      }
+    }
+    const toolsError = validateToolsSettings(draft.tools, draft.tool_choice, {
+      toolsSupported,
+    });
+    if (toolsError) {
+      setFormError(toolsError.message);
+      return false;
+    }
+    const authError = validateAuthSettings(draft.extra_headers, draft.api_key_query_param, {
+      customHeaders: customHeadersSupported,
+      apiKeyQuery: apiKeyQuerySupported,
+    });
+    if (authError) {
+      setFormError(authError.message);
+      return false;
+    }
     const saved = await saveProvider();
     if (saved) {
       setShowKey(false);
@@ -295,13 +369,38 @@ export function ProviderSettingsPage() {
 
   const updateModelField = (
     modelId: string,
-    patch: Partial<Pick<ModelRecord, "temperature" | "max_tokens" | "display_name">>,
+    patch: Partial<Pick<ModelRecord, "temperature" | "max_tokens" | "display_name" | "reasoning">>,
   ) => {
     if (!draft) {
       return;
     }
     setRetainedModels(
       draft.models.map((model) => (model.id === modelId ? { ...model, ...patch } : model)),
+    );
+  };
+
+  const updateModelReasoning = (
+    modelId: string,
+    patch: Partial<StoredReasoningSettings>,
+  ) => {
+    if (!draft) {
+      return;
+    }
+    setRetainedModels(
+      draft.models.map((model) => {
+        if (model.id !== modelId) {
+          return model;
+        }
+        const current: StoredReasoningSettings = model.reasoning ?? {
+          mode: "auto",
+          effort: null,
+          budget_tokens: null,
+        };
+        return {
+          ...model,
+          reasoning: normalizeStoredReasoning({ ...current, ...patch }),
+        };
+      }),
     );
   };
 
@@ -706,9 +805,290 @@ export function ProviderSettingsPage() {
                           />
                         </Field>
                       </div>
+                      <div className="mprism-model-fields" style={{ marginTop: 8 }}>
+                        <Field
+                          label={t("settings.reasoning.mode")}
+                          hint={
+                            reasoningControl
+                              ? t("settings.reasoning.requestVsResponse")
+                              : protocolReasoningHint(draft.protocol)
+                          }
+                        >
+                          <Select
+                            placement="auto"
+                            value={normalizeReasoningMode(model.reasoning?.mode)}
+                            disabled={!reasoningControl}
+                            options={[
+                              {
+                                value: "auto",
+                                label: t("settings.reasoning.modeAuto"),
+                              },
+                              {
+                                value: "off",
+                                label: t("settings.reasoning.modeOff"),
+                              },
+                              {
+                                value: "on",
+                                label: t("settings.reasoning.modeOn"),
+                              },
+                            ]}
+                            onChange={(mode) => {
+                              if (mode === "auto" || mode === "off" || mode === "on") {
+                                updateModelReasoning(model.id, {
+                                  mode: mode as ReasoningModeId,
+                                });
+                              }
+                            }}
+                          />
+                        </Field>
+                        {reasoningControl &&
+                          normalizeReasoningMode(model.reasoning?.mode) === "on" && (
+                            <>
+                              <Field label={t("settings.reasoning.effort")}>
+                                <Select
+                                  placement="auto"
+                                  value={(model.reasoning?.effort as string) || ""}
+                                  options={[
+                                    {
+                                      value: "",
+                                      label: t("settings.reasoning.effortNone"),
+                                    },
+                                    { value: "minimal", label: "minimal" },
+                                    { value: "low", label: "low" },
+                                    { value: "medium", label: "medium" },
+                                    { value: "high", label: "high" },
+                                    { value: "xhigh", label: "xhigh" },
+                                    { value: "max", label: "max" },
+                                  ]}
+                                  onChange={(effort) => {
+                                    updateModelReasoning(model.id, {
+                                      effort: (effort || null) as ReasoningEffortId | null,
+                                    });
+                                  }}
+                                />
+                              </Field>
+                              <Field
+                                label={t("settings.reasoning.budget")}
+                                hint={protocolReasoningHint(draft.protocol)}
+                              >
+                                <Input
+                                  type="number"
+                                  value={model.reasoning?.budget_tokens?.toString() ?? ""}
+                                  placeholder={t("settings.reasoning.budgetPlaceholder")}
+                                  onChange={(event) => {
+                                    const raw = event.target.value.trim();
+                                    updateModelReasoning(model.id, {
+                                      budget_tokens:
+                                        raw === "" ? null : Number(raw),
+                                    });
+                                  }}
+                                />
+                              </Field>
+                            </>
+                          )}
+                      </div>
                     </div>
                   );
                 })}
+              </div>
+            )}
+          </div>
+
+          <div style={{ marginTop: 16 }}>
+            <button
+              type="button"
+              className="mprism-linkish"
+              onClick={() => setAuthOpen((v) => !v)}
+              style={{
+                background: "none",
+                border: "none",
+                padding: 0,
+                cursor: "pointer",
+                color: "inherit",
+                font: "inherit",
+                textAlign: "left",
+              }}
+            >
+              <h3 className="mprism-title3" style={{ margin: 0 }}>
+                {t("settings.auth.title")} {authOpen ? "▾" : "▸"}
+              </h3>
+            </button>
+            <p className="mprism-body mprism-muted">{t("settings.auth.advanced")}</p>
+            {authOpen && (
+              <div className="mprism-form-grid" style={{ marginTop: 8 }}>
+                <Alert type="warning">{t("settings.auth.warning")}</Alert>
+                <Field label={t("settings.auth.extraHeaders")}>
+                  {!customHeadersSupported ? (
+                    <p className="mprism-muted">{t("settings.auth.headersUnsupported")}</p>
+                  ) : (
+                    <div className="mprism-form-grid">
+                      {draft.extra_headers.map((header, index) => (
+                        <div key={`hdr-${index}`} className="mprism-key-row">
+                          <Input
+                            value={header.name}
+                            placeholder={t("settings.auth.headerName")}
+                            onChange={(event) => {
+                              const next = draft.extra_headers.map((item, i) =>
+                                i === index ? { ...item, name: event.target.value } : item,
+                              );
+                              updateDraft({ extra_headers: next });
+                            }}
+                          />
+                          <Input
+                            value={header.value}
+                            placeholder={t("settings.auth.headerValue")}
+                            onChange={(event) => {
+                              const next = draft.extra_headers.map((item, i) =>
+                                i === index ? { ...item, value: event.target.value } : item,
+                              );
+                              updateDraft({ extra_headers: next });
+                            }}
+                          />
+                          <Tooltip content={t("settings.auth.removeHeader")} placement="bottom">
+                            <Button
+                              variant="ghost"
+                              icon={<IconTrash size={16} />}
+                              aria-label={t("settings.auth.removeHeader")}
+                              onClick={() => {
+                                updateDraft({
+                                  extra_headers: draft.extra_headers.filter((_, i) => i !== index),
+                                });
+                              }}
+                            />
+                          </Tooltip>
+                        </div>
+                      ))}
+                      <div className="mprism-action-row">
+                        <Button
+                          variant="outline"
+                          onClick={() =>
+                            updateDraft({
+                              extra_headers: [...draft.extra_headers, { name: "", value: "" }],
+                            })
+                          }
+                        >
+                          {t("settings.auth.addHeader")}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                </Field>
+                <Field
+                  label={t("settings.auth.apiKeyQuery")}
+                  hint={
+                    apiKeyQuerySupported
+                      ? t("settings.auth.apiKeyQueryHint")
+                      : t("settings.auth.queryUnsupported")
+                  }
+                >
+                  <Input
+                    value={draft.api_key_query_param ?? ""}
+                    disabled={!apiKeyQuerySupported}
+                    placeholder={t("settings.auth.apiKeyQueryPlaceholder")}
+                    onChange={(event) =>
+                      updateDraft({
+                        api_key_query_param: event.target.value,
+                      })
+                    }
+                  />
+                </Field>
+              </div>
+            )}
+          </div>
+
+          <div style={{ marginTop: 16 }}>
+            <h3 className="mprism-title3">{t("settings.tools.title")}</h3>
+            <p className="mprism-body mprism-muted">{t("settings.tools.hint")}</p>
+            {!toolsSupported ? (
+              <Alert type="warning">{t("settings.tools.unsupported")}</Alert>
+            ) : (
+              <div className="mprism-form-grid">
+                <Field label={t("settings.tools.jsonLabel")} hint={t("settings.tools.hint")}>
+                  <Textarea
+                    rows={8}
+                    value={toolsJsonText}
+                    placeholder={t("settings.tools.jsonPlaceholder")}
+                    onChange={(event) => {
+                      setToolsJsonText(event.target.value);
+                      setToolsJsonError(null);
+                    }}
+                  />
+                </Field>
+                <div className="mprism-action-row">
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      const parsed = parseToolsJsonText(toolsJsonText);
+                      if (!parsed.ok) {
+                        setToolsJsonError(parsed.message);
+                        return;
+                      }
+                      setToolsJsonError(null);
+                      const nextChoice =
+                        parsed.tools.length === 0
+                          ? null
+                          : draft.tool_choice ?? { mode: "auto" as ToolChoiceModeId, name: null };
+                      updateDraft({
+                        tools: parsed.tools,
+                        tool_choice: nextChoice,
+                      });
+                    }}
+                  >
+                    {t("settings.tools.applyJson")}
+                  </Button>
+                </div>
+                {toolsJsonError && <Alert type="error">{toolsJsonError}</Alert>}
+                <Field label={t("settings.tools.toolChoice")}>
+                  <Select
+                    placement="auto"
+                    value={normalizeToolChoiceMode(draft.tool_choice?.mode)}
+                    disabled={draft.tools.length === 0}
+                    options={[
+                      { value: "auto", label: t("settings.tools.choiceAuto") },
+                      { value: "none", label: t("settings.tools.choiceNone") },
+                      { value: "required", label: t("settings.tools.choiceRequired") },
+                      { value: "named", label: t("settings.tools.choiceNamed") },
+                    ]}
+                    onChange={(mode) => {
+                      if (
+                        mode === "auto" ||
+                        mode === "none" ||
+                        mode === "required" ||
+                        mode === "named"
+                      ) {
+                        updateDraft({
+                          tool_choice: {
+                            mode: mode as ToolChoiceModeId,
+                            name:
+                              mode === "named"
+                                ? draft.tool_choice?.name || draft.tools[0]?.name || null
+                                : null,
+                          },
+                        });
+                      }
+                    }}
+                  />
+                </Field>
+                {normalizeToolChoiceMode(draft.tool_choice?.mode) === "named" && (
+                  <Field label={t("settings.tools.namedTool")}>
+                    <Select
+                      placement="auto"
+                      value={draft.tool_choice?.name || draft.tools[0]?.name || ""}
+                      options={draft.tools.map((tool) => ({
+                        value: tool.name,
+                        label: tool.name,
+                      }))}
+                      onChange={(name) => {
+                        updateDraft({
+                          tool_choice: {
+                            mode: "named",
+                            name,
+                          },
+                        });
+                      }}
+                    />
+                  </Field>
+                )}
               </div>
             )}
           </div>

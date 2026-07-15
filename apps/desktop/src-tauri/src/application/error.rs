@@ -12,6 +12,8 @@ pub struct AppError {
     pub http_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 impl AppError {
@@ -22,6 +24,7 @@ impl AppError {
             retryable,
             http_status: None,
             provider_request_id: None,
+            retry_after_ms: None,
         }
     }
 
@@ -44,6 +47,7 @@ impl AppError {
             retryable: self.retryable,
             http_status: self.http_status,
             provider_request_id: self.provider_request_id.clone(),
+            retry_after_ms: self.retry_after_ms,
         }
     }
 }
@@ -77,7 +81,8 @@ impl From<StorageError> for AppError {
 
 impl From<ProtocolError> for AppError {
     fn from(error: ProtocolError) -> Self {
-        let (code, message) = match error.kind {
+        let provider_detail = error.message.trim();
+        let (code, default_message) = match error.kind {
             ProtocolErrorKind::InvalidConfiguration | ProtocolErrorKind::InvalidRequest => {
                 ("validation", "模型请求配置无效")
             }
@@ -94,16 +99,30 @@ impl From<ProtocolError> for AppError {
             }
             ProtocolErrorKind::Timeout => ("timeout", "模型服务请求超时"),
             ProtocolErrorKind::Transport => ("transport", "无法连接模型服务"),
-            ProtocolErrorKind::Decode
-            | ProtocolErrorKind::UnexpectedEof
-            | ProtocolErrorKind::Unsupported => ("protocol", "模型服务返回了无法解析的响应"),
+            ProtocolErrorKind::Unsupported => ("unsupported", "当前协议不支持该请求能力"),
+            ProtocolErrorKind::Decode | ProtocolErrorKind::UnexpectedEof => {
+                ("protocol", "模型服务返回了无法解析的响应")
+            }
+        };
+        // Prefer SDK message for validation/unsupported so capability gates stay actionable.
+        let message = if matches!(
+            error.kind,
+            ProtocolErrorKind::InvalidConfiguration
+                | ProtocolErrorKind::InvalidRequest
+                | ProtocolErrorKind::Unsupported
+        ) && !provider_detail.is_empty()
+        {
+            provider_detail.to_string()
+        } else {
+            default_message.to_string()
         };
         Self {
             code,
-            message: message.to_string(),
+            message,
             retryable: error.retryable,
             http_status: error.http_status,
             provider_request_id: error.request_id,
+            retry_after_ms: error.retry_after_ms,
         }
     }
 }

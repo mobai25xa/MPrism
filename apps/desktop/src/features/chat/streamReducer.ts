@@ -18,6 +18,7 @@ export function createGenerationState(
     nextSequence: 0,
     reasoning: "",
     content: "",
+    toolCalls: [],
     phase: "starting",
     error: null,
   };
@@ -58,6 +59,16 @@ export function reduceStreamEvent(
       next.phase = "streaming";
       next.content = `${state.content}${envelope.event.text}`;
       return { kind: "update", state: next };
+    case "tool_call_delta": {
+      next.phase = "streaming";
+      next.toolCalls = upsertToolCallDelta(state.toolCalls, envelope.event);
+      return { kind: "update", state: next };
+    }
+    case "tool_call_finished": {
+      next.phase = "streaming";
+      next.toolCalls = finishToolCall(state.toolCalls, envelope.event);
+      return { kind: "update", state: next };
+    }
     case "usage":
       next.usage = envelope.event.usage;
       return { kind: "update", state: next };
@@ -71,6 +82,71 @@ export function reduceStreamEvent(
     default:
       return { kind: "ignore" };
   }
+}
+
+function upsertToolCallDelta(
+  calls: GenerationState["toolCalls"],
+  event: Extract<StreamEnvelope["event"], { type: "tool_call_delta" }>,
+): GenerationState["toolCalls"] {
+  const next = calls.map((c) => ({ ...c }));
+  let idx = -1;
+  if (event.index != null) {
+    idx = next.findIndex((c) => c.index === event.index);
+  }
+  if (idx < 0 && event.id) {
+    idx = next.findIndex((c) => c.id === event.id);
+  }
+  if (idx < 0) {
+    next.push({
+      id: event.id ?? null,
+      name: event.name ?? null,
+      arguments: event.arguments_delta ?? "",
+      index: event.index ?? null,
+      finished: false,
+    });
+    return next;
+  }
+  const cur = next[idx];
+  next[idx] = {
+    ...cur,
+    id: event.id ?? cur.id,
+    name: event.name ?? cur.name,
+    arguments: `${cur.arguments}${event.arguments_delta ?? ""}`,
+    index: event.index ?? cur.index,
+  };
+  return next;
+}
+
+function finishToolCall(
+  calls: GenerationState["toolCalls"],
+  event: Extract<StreamEnvelope["event"], { type: "tool_call_finished" }>,
+): GenerationState["toolCalls"] {
+  const next = calls.map((c) => ({ ...c }));
+  let idx = -1;
+  if (event.index != null) {
+    idx = next.findIndex((c) => c.index === event.index);
+  }
+  if (idx < 0) {
+    idx = next.findIndex((c) => c.id === event.id);
+  }
+  if (idx < 0) {
+    next.push({
+      id: event.id,
+      name: event.name,
+      arguments: event.arguments,
+      index: event.index ?? null,
+      finished: true,
+    });
+    return next;
+  }
+  next[idx] = {
+    id: event.id,
+    name: event.name,
+    arguments: event.arguments,
+    index: event.index ?? next[idx].index,
+    finished: true,
+  };
+  return next;
 }
 
 export function optimisticUserMessage(
@@ -101,9 +177,63 @@ export function streamingAssistantMessage(state: GenerationState): MessageRecord
     reasoning: state.reasoning || null,
     status: state.phase === "cancelling" ? "stopped" : null,
     request_id: state.requestId,
+    usage: state.usage,
+    tool_calls: state.toolCalls
+      .filter((call) => call.name || call.arguments || call.id)
+      .map((call) => ({
+        id: call.id ?? "",
+        name: call.name ?? "",
+        arguments: call.arguments,
+        index: call.index ?? null,
+      })),
     created_by_device_id: "local",
     created_at: new Date().toISOString(),
   };
+}
+
+/** Stable finish_reason display (IPC values). */
+export function formatFinishReason(reason: string | null | undefined): string | null {
+  if (!reason) {
+    return null;
+  }
+  switch (reason) {
+    case "stop":
+      return "stop";
+    case "length":
+      return "length";
+    case "content_filter":
+      return "content_filter";
+    case "tool_calls":
+      return "tool_calls";
+    default:
+      return reason.startsWith("other:") ? reason : `other:${reason}`;
+  }
+}
+
+/** Usage line only includes present fields (no fake zeros). */
+export function formatTokenUsage(
+  usage: MessageRecord["usage"] | GenerationState["usage"] | null | undefined,
+): string | null {
+  if (!usage) {
+    return null;
+  }
+  const parts: string[] = [];
+  if (usage.prompt_tokens != null) {
+    parts.push(`prompt ${usage.prompt_tokens}`);
+  }
+  if (usage.completion_tokens != null) {
+    parts.push(`completion ${usage.completion_tokens}`);
+  }
+  if (usage.total_tokens != null) {
+    parts.push(`total ${usage.total_tokens}`);
+  }
+  if (usage.reasoning_tokens != null) {
+    parts.push(`reasoning ${usage.reasoning_tokens}`);
+  }
+  if (usage.cached_tokens != null) {
+    parts.push(`cached ${usage.cached_tokens}`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 export function shouldSendOnEnter(event: {

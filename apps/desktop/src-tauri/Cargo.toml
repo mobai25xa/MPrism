@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 dirs = "6"
 futures-util = "0.3"
 mprism-protocol = { workspace = true }
