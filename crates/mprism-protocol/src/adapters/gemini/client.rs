@@ -2,13 +2,12 @@
 
 use super::stream_decode::{decode_sse_data, EventDecodeState};
 use crate::adapter::{ChatStream, ProtocolAdapter};
-use crate::error::{
-    kind_from_status, parse_provider_error_body, redact_secrets, ProtocolError, ProtocolErrorKind,
-    ERROR_BODY_LIMIT,
-};
+use crate::auth::{apply_api_key_query, merge_extra_headers};
+use crate::error::{map_http_error, ErrorBodyFamily, ProtocolError, ProtocolErrorKind};
 use crate::sse::SseParser;
 use crate::types::{
-    join_api_path, ChatRequest, ChatRole, ModelInfo, ProtocolKind, ProviderEndpoint, StreamEvent,
+    join_api_path, ChatRequest, ChatRole, ModelInfo, ProtocolCapabilities, ProtocolKind,
+    ProviderEndpoint, StreamEvent,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -22,17 +21,24 @@ use url::Url;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Stream idle timeout (no body bytes): model-protocol-sdk §5.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Gemini generateContent / streamGenerateContent adapter.
 #[derive(Debug, Clone)]
 pub struct GeminiGenerateContentAdapter {
     client: Client,
+    stream_idle_timeout: Duration,
 }
 
 impl GeminiGenerateContentAdapter {
     /// Create an adapter with default HTTP timeouts.
     pub fn new() -> Result<Self, ProtocolError> {
+        Self::with_stream_idle_timeout(STREAM_IDLE_TIMEOUT)
+    }
+
+    /// Create an adapter with a custom stream idle timeout (tests / specialized hosts).
+    pub fn with_stream_idle_timeout(stream_idle_timeout: Duration) -> Result<Self, ProtocolError> {
         let client = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
@@ -42,10 +48,16 @@ impl GeminiGenerateContentAdapter {
                     format!("创建 HTTP 客户端失败: {err}"),
                 )
             })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            stream_idle_timeout,
+        })
     }
 
-    fn auth_headers(endpoint: &ProviderEndpoint, accept_event_stream: bool) -> HeaderMap {
+    fn auth_headers(
+        endpoint: &ProviderEndpoint,
+        accept_event_stream: bool,
+    ) -> Result<HeaderMap, ProtocolError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if accept_event_stream {
@@ -58,41 +70,15 @@ impl GeminiGenerateContentAdapter {
                 headers.insert(HeaderName::from_static("x-goog-api-key"), v);
             }
         }
-        headers
+        merge_extra_headers(&mut headers, &endpoint.auth)?;
+        Ok(headers)
     }
 
     async fn map_error_response(response: Response) -> ProtocolError {
-        let status = response.status();
-        let request_id = response
-            .headers()
-            .get("x-goog-request-id")
-            .or_else(|| response.headers().get("x-request-id"))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let kind = kind_from_status(status.as_u16());
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let bytes = response.bytes().await.unwrap_or_default();
-        let limited = if bytes.len() > ERROR_BODY_LIMIT {
-            &bytes[..ERROR_BODY_LIMIT]
-        } else {
-            &bytes
-        };
-        let body = String::from_utf8_lossy(limited);
-        let (message, code) = parse_gemini_error_body(&body);
-        let message = message.unwrap_or_else(|| {
-            if body.trim().is_empty() {
-                format!("服务商返回 HTTP {}", status.as_u16())
-            } else {
-                redact_secrets(body.trim())
-            }
-        });
-        let mut err = ProtocolError::new(kind, message).with_http_status(status.as_u16());
-        if let Some(code) = code {
-            err = err.with_provider_code(code);
-        }
-        if let Some(id) = request_id {
-            err = err.with_request_id(id);
-        }
-        err
+        map_http_error(status, &headers, &bytes, ErrorBodyFamily::Gemini)
     }
 }
 
@@ -108,6 +94,20 @@ impl ProtocolAdapter for GeminiGenerateContentAdapter {
         ProtocolKind::GeminiGenerateContent
     }
 
+    fn capabilities(&self) -> ProtocolCapabilities {
+        ProtocolCapabilities {
+            streaming: true,
+            list_models: true,
+            reasoning_output: true,
+            reasoning_control: true,
+            tools: true,
+            vision_input: true,
+            stream_usage: true,
+            custom_headers: true,
+            api_key_query: true,
+        }
+    }
+
     async fn list_models(
         &self,
         endpoint: &ProviderEndpoint,
@@ -119,11 +119,11 @@ impl ProtocolAdapter for GeminiGenerateContentAdapter {
             ));
         }
 
-        let url = join_api_path(&endpoint.base_url, "models")?;
+        let url = apply_api_key_query(join_api_path(&endpoint.base_url, "models")?, endpoint);
         let request = self
             .client
             .get(url)
-            .headers(Self::auth_headers(endpoint, false));
+            .headers(Self::auth_headers(endpoint, false)?);
 
         let response = timeout(LIST_TIMEOUT, request.send())
             .await
@@ -157,13 +157,17 @@ impl ProtocolAdapter for GeminiGenerateContentAdapter {
             ));
         }
         request.validate()?;
+        request.check_capabilities(&self.capabilities())?;
 
-        let url = stream_generate_content_url(&endpoint.base_url, &request.model)?;
-        let wire = WireGenerateContentRequest::from_request(&request);
+        let url = apply_api_key_query(
+            stream_generate_content_url(&endpoint.base_url, &request.model)?,
+            endpoint,
+        );
+        let wire = WireGenerateContentRequest::try_from_request(&request)?;
         let http_request = self
             .client
             .post(url)
-            .headers(Self::auth_headers(endpoint, true))
+            .headers(Self::auth_headers(endpoint, true)?)
             .json(&wire);
 
         let response = http_request.send().await.map_err(map_reqwest_error)?;
@@ -172,14 +176,16 @@ impl ProtocolAdapter for GeminiGenerateContentAdapter {
         }
 
         let mut byte_stream = response.bytes_stream();
+        let idle = self.stream_idle_timeout;
         let stream = async_stream::stream! {
             let mut parser = SseParser::new();
             let mut decode_state = EventDecodeState::default();
             let mut completed = false;
             let mut failed = false;
 
+            // Dropping this stream cancels further polling and does not fabricate Completed (§3.8).
             while !completed && !failed {
-                let next = timeout(STREAM_IDLE_TIMEOUT, byte_stream.next()).await;
+                let next = timeout(idle, byte_stream.next()).await;
                 match next {
                     Err(_) => {
                         failed = true;
@@ -254,28 +260,6 @@ fn map_reqwest_error(err: reqwest::Error) -> ProtocolError {
             .with_retryable(true);
     }
     ProtocolError::new(ProtocolErrorKind::Transport, format!("网络错误: {err}"))
-}
-
-fn parse_gemini_error_body(body: &str) -> (Option<String>, Option<String>) {
-    let (message, openai_code) = parse_provider_error_body(body);
-    let value: Value = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(_) => return (message, openai_code),
-    };
-    let err = value.get("error");
-    let code = err
-        .and_then(|e| e.get("status"))
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            err.and_then(|e| e.get("code")).and_then(|c| {
-                c.as_str()
-                    .map(|s| s.to_string())
-                    .or_else(|| c.as_i64().map(|n| n.to_string()))
-            })
-        })
-        .or(openai_code);
-    (message, code)
 }
 
 fn parse_models_body(body: &[u8]) -> Result<Vec<ModelInfo>, ProtocolError> {
@@ -353,23 +337,15 @@ fn stream_generate_content_url(base: &Url, model: &str) -> Result<Url, ProtocolE
 
 #[derive(Debug, Serialize)]
 struct WireGenerateContentRequest {
-    contents: Vec<WireContent>,
+    contents: Vec<Value>,
     #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
-    system_instruction: Option<WireContent>,
+    system_instruction: Option<Value>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
     generation_config: Option<WireGenerationConfig>,
-}
-
-#[derive(Debug, Serialize)]
-struct WireContent {
     #[serde(skip_serializing_if = "Option::is_none")]
-    role: Option<String>,
-    parts: Vec<WirePart>,
-}
-
-#[derive(Debug, Serialize)]
-struct WirePart {
-    text: String,
+    tools: Option<Vec<Value>>,
+    #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
+    tool_config: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -378,58 +354,281 @@ struct WireGenerationConfig {
     temperature: Option<f32>,
     #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<WireThinkingConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct WireThinkingConfig {
+    #[serde(rename = "includeThoughts", skip_serializing_if = "Option::is_none")]
+    include_thoughts: Option<bool>,
+    #[serde(rename = "thinkingBudget", skip_serializing_if = "Option::is_none")]
+    thinking_budget: Option<u32>,
+    #[serde(rename = "thinkingLevel", skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<String>,
 }
 
 impl WireGenerateContentRequest {
-    fn from_request(request: &ChatRequest) -> Self {
+    fn try_from_request(request: &ChatRequest) -> Result<Self, ProtocolError> {
         let mut system_parts = Vec::new();
         let mut contents = Vec::new();
         for m in &request.messages {
             match m.role {
                 ChatRole::System => {
-                    if !m.content.is_empty() {
-                        system_parts.push(m.content.clone());
+                    if !m.text_content().is_empty() {
+                        system_parts.push(m.text_content());
                     }
                 }
                 ChatRole::User => {
-                    contents.push(WireContent {
-                        role: Some("user".into()),
-                        parts: vec![WirePart {
-                            text: m.content.clone(),
-                        }],
-                    });
+                    contents.push(serde_json::json!({
+                        "role": "user",
+                        "parts": encode_gemini_parts(m)?,
+                    }));
                 }
                 ChatRole::Assistant => {
-                    contents.push(WireContent {
-                        role: Some("model".into()),
-                        parts: vec![WirePart {
-                            text: m.content.clone(),
+                    let mut parts = encode_gemini_parts(m)?;
+                    for tc in &m.tool_calls {
+                        let args = serde_json::from_str::<Value>(&tc.arguments)
+                            .unwrap_or_else(|_| Value::String(tc.arguments.clone()));
+                        // Preserve call id in name-only public model; Gemini uses name+args.
+                        // If arguments already include thought signature fields from history,
+                        // callers must pass them through `arguments` JSON as returned by the model.
+                        parts.push(serde_json::json!({
+                            "functionCall": {
+                                "name": tc.name,
+                                "args": args,
+                            }
+                        }));
+                    }
+                    if parts.is_empty() {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorKind::InvalidRequest,
+                            "消息 content 编码结果为空",
+                        ));
+                    }
+                    contents.push(serde_json::json!({
+                        "role": "model",
+                        "parts": parts,
+                    }));
+                }
+                ChatRole::Tool => {
+                    let name = m
+                        .tool_call_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("tool");
+                    // Public tool_call_id maps to function name for Gemini functionResponse
+                    // when the app stores the function name in tool_call_id or a synthetic id.
+                    // Prefer name from tool_call_id; response body is text parts.
+                    let response = serde_json::from_str::<Value>(&m.text_content())
+                        .unwrap_or_else(|_| serde_json::json!({ "result": m.text_content() }));
+                    contents.push(serde_json::json!({
+                        "role": "user",
+                        "parts": [{
+                            "functionResponse": {
+                                "name": name,
+                                "response": response,
+                            }
                         }],
-                    });
+                    }));
                 }
             }
         }
         let system_instruction = if system_parts.is_empty() {
             None
         } else {
-            Some(WireContent {
-                role: None,
-                parts: vec![WirePart {
-                    text: system_parts.join("\n\n"),
-                }],
-            })
+            Some(serde_json::json!({
+                "parts": [{ "text": system_parts.join("\n\n") }],
+            }))
         };
-        let generation_config = match (request.temperature, request.max_tokens) {
-            (None, None) => None,
-            (temperature, max_output_tokens) => Some(WireGenerationConfig {
+        let thinking_config = encode_gemini_thinking(request.reasoning.as_ref(), &request.model)?;
+        let generation_config = match (request.temperature, request.max_tokens, thinking_config) {
+            (None, None, None) => None,
+            (temperature, max_output_tokens, thinking_config) => Some(WireGenerationConfig {
                 temperature,
                 max_output_tokens,
+                thinking_config,
             }),
         };
-        Self {
+        let tools = encode_gemini_tools(request.tools.as_ref());
+        let tool_config = encode_gemini_tool_config(request.tool_choice.as_ref(), tools.is_some());
+        Ok(Self {
             contents,
             system_instruction,
             generation_config,
+            tools,
+            tool_config,
+        })
+    }
+}
+
+/// mapping-v2 §6: Text + ImageBase64; ImageUrl → Unsupported.
+fn encode_gemini_parts(message: &crate::types::ChatMessage) -> Result<Vec<Value>, ProtocolError> {
+    use crate::types::ContentPart;
+    let mut parts = Vec::with_capacity(message.parts.len());
+    for part in &message.parts {
+        match part {
+            ContentPart::Text { text } => {
+                if text.is_empty() {
+                    continue;
+                }
+                parts.push(serde_json::json!({ "text": text }));
+            }
+            ContentPart::ImageBase64 { media_type, data } => {
+                let data: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+                parts.push(serde_json::json!({
+                    "inline_data": {
+                        "mime_type": media_type.trim(),
+                        "data": data,
+                    }
+                }));
+            }
+            ContentPart::ImageUrl { .. } => {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::Unsupported,
+                    "Gemini V2 不映射 ImageUrl（任意 http(s) URL）；请使用 ImageBase64",
+                ));
+            }
+        }
+    }
+    Ok(parts)
+}
+
+fn encode_gemini_tools(tools: Option<&Vec<crate::types::ToolDefinition>>) -> Option<Vec<Value>> {
+    tools.map(|tools| {
+        let decls: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("name".into(), Value::String(t.name.trim().to_string()));
+                if let Some(desc) = &t.description {
+                    obj.insert("description".into(), Value::String(desc.clone()));
+                }
+                obj.insert("parameters".into(), t.parameters.clone());
+                Value::Object(obj)
+            })
+            .collect();
+        vec![serde_json::json!({
+            "functionDeclarations": decls,
+        })]
+    })
+}
+
+fn encode_gemini_tool_config(
+    choice: Option<&crate::types::ToolChoice>,
+    has_tools: bool,
+) -> Option<Value> {
+    use crate::types::ToolChoice;
+    let mode = match choice {
+        None if has_tools => "AUTO",
+        None => return None,
+        Some(ToolChoice::Auto) => "AUTO",
+        Some(ToolChoice::None) => "NONE",
+        Some(ToolChoice::Required) => "ANY",
+        Some(ToolChoice::Named { name }) => {
+            return Some(serde_json::json!({
+                "functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": [name],
+                }
+            }));
+        }
+    };
+    Some(serde_json::json!({
+        "functionCallingConfig": { "mode": mode }
+    }))
+}
+
+/// Prefer thinkingLevel (Gemini 3); budget-only models (2.5) use thinkingBudget.
+fn model_prefers_budget_only(model: &str) -> bool {
+    let id = model.trim().to_ascii_lowercase();
+    let id = id.strip_prefix("models/").unwrap_or(&id);
+    // 2.5 series documents thinkingBudget; treat as budget-only path.
+    id.contains("2.5") || id.contains("2-5")
+}
+
+/// Encode `generationConfig.thinkingConfig` per mapping-v2 §4.
+fn encode_gemini_thinking(
+    policy: Option<&crate::types::ReasoningPolicy>,
+    model: &str,
+) -> Result<Option<WireThinkingConfig>, ProtocolError> {
+    use crate::types::{ReasoningEffort, ReasoningMode};
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    match policy.mode {
+        ReasoningMode::Auto => Ok(None),
+        ReasoningMode::Off => Ok(Some(WireThinkingConfig {
+            include_thoughts: None,
+            thinking_budget: Some(0),
+            thinking_level: None,
+        })),
+        ReasoningMode::On => {
+            // budget_tokens == 0 is treated as Off.
+            if policy.budget_tokens == Some(0) {
+                return Ok(Some(WireThinkingConfig {
+                    include_thoughts: None,
+                    thinking_budget: Some(0),
+                    thinking_level: None,
+                }));
+            }
+            // budget takes precedence over effort.
+            if let Some(n) = policy.budget_tokens {
+                return Ok(Some(WireThinkingConfig {
+                    include_thoughts: Some(true),
+                    thinking_budget: Some(n),
+                    thinking_level: None,
+                }));
+            }
+            let budget_only = model_prefers_budget_only(model);
+            match policy.effort {
+                None => {
+                    if budget_only {
+                        Ok(Some(WireThinkingConfig {
+                            include_thoughts: Some(true),
+                            thinking_budget: Some(4096),
+                            thinking_level: None,
+                        }))
+                    } else {
+                        Ok(Some(WireThinkingConfig {
+                            include_thoughts: Some(true),
+                            thinking_budget: None,
+                            thinking_level: Some("medium".into()),
+                        }))
+                    }
+                }
+                Some(effort) => {
+                    if budget_only {
+                        let budget = match effort {
+                            ReasoningEffort::Minimal => 1024,
+                            ReasoningEffort::Low => 1024,
+                            ReasoningEffort::Medium => 4096,
+                            ReasoningEffort::High => 8192,
+                            ReasoningEffort::XHigh | ReasoningEffort::Max => 8192,
+                        };
+                        Ok(Some(WireThinkingConfig {
+                            include_thoughts: Some(true),
+                            thinking_budget: Some(budget),
+                            thinking_level: None,
+                        }))
+                    } else {
+                        let level = match effort {
+                            ReasoningEffort::Minimal => "minimal",
+                            ReasoningEffort::Low => "low",
+                            ReasoningEffort::Medium => "medium",
+                            ReasoningEffort::High
+                            | ReasoningEffort::XHigh
+                            | ReasoningEffort::Max => "high",
+                        };
+                        Ok(Some(WireThinkingConfig {
+                            include_thoughts: Some(true),
+                            thinking_budget: None,
+                            thinking_level: Some(level.into()),
+                        }))
+                    }
+                }
+            }
         }
     }
 }
@@ -438,12 +637,82 @@ impl WireGenerateContentRequest {
 mod tests {
     use super::*;
     use crate::secret::SecretString;
-    use crate::types::{normalize_base_url, ChatMessage};
+    use crate::types::{
+        normalize_base_url, ChatMessage, ReasoningEffort, ReasoningMode, ReasoningPolicy,
+    };
 
     #[test]
     fn kind_is_gemini() {
         let adapter = GeminiGenerateContentAdapter::new().unwrap();
         assert_eq!(adapter.kind(), ProtocolKind::GeminiGenerateContent);
+        let caps = adapter.capabilities();
+        assert!(caps.reasoning_control);
+        assert!(caps.reasoning_output);
+        assert!(caps.tools);
+        assert!(caps.vision_input);
+        assert!(caps.stream_usage);
+        assert!(caps.custom_headers);
+        assert!(caps.api_key_query);
+    }
+
+    #[test]
+    fn tools_function_declarations_and_response() {
+        use crate::types::{ToolChoice, ToolDefinition};
+        let req = ChatRequest {
+            model: "gemini-2.0-flash".into(),
+            messages: vec![
+                ChatMessage::text(ChatRole::User, "hi"),
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    parts: vec![],
+                    tool_call_id: None,
+                    tool_calls: vec![crate::types::ToolCall {
+                        id: "lookup".into(),
+                        name: "lookup".into(),
+                        arguments: r#"{"q":1}"#.into(),
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    parts: vec![crate::types::ContentPart::Text {
+                        text: r#"{"result":"ok"}"#.into(),
+                    }],
+                    tool_call_id: Some("lookup".into()),
+                    tool_calls: vec![],
+                },
+            ],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: Some(vec![ToolDefinition {
+                name: "lookup".into(),
+                description: Some("d".into()),
+                parameters: serde_json::json!({"type":"object"}),
+            }]),
+            tool_choice: Some(ToolChoice::Named {
+                name: "lookup".into(),
+            }),
+        };
+        let json =
+            serde_json::to_value(WireGenerateContentRequest::try_from_request(&req).unwrap())
+                .unwrap();
+        assert_eq!(
+            json["tools"][0]["functionDeclarations"][0]["name"],
+            "lookup"
+        );
+        assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+        assert_eq!(
+            json["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
+            "lookup"
+        );
+        assert_eq!(
+            json["contents"][1]["parts"][0]["functionCall"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            json["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "lookup"
+        );
     }
 
     #[test]
@@ -451,23 +720,17 @@ mod tests {
         let req = ChatRequest {
             model: "gemini-2.0-flash".into(),
             messages: vec![
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: "sys".into(),
-                },
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: "hi".into(),
-                },
-                ChatMessage {
-                    role: ChatRole::Assistant,
-                    content: "yo".into(),
-                },
+                ChatMessage::text(ChatRole::System, "sys"),
+                ChatMessage::text(ChatRole::User, "hi"),
+                ChatMessage::text(ChatRole::Assistant, "yo"),
             ],
             temperature: Some(0.5),
             max_tokens: Some(128),
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
         };
-        let wire = WireGenerateContentRequest::from_request(&req);
+        let wire = WireGenerateContentRequest::try_from_request(&req).unwrap();
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json["systemInstruction"]["parts"][0]["text"], "sys");
         assert_eq!(json["contents"][0]["role"], "user");
@@ -475,23 +738,234 @@ mod tests {
         assert_eq!(json["generationConfig"]["temperature"], 0.5);
         assert_eq!(json["generationConfig"]["maxOutputTokens"], 128);
         assert!(json.get("tools").is_none());
+        assert!(json["generationConfig"].get("thinkingConfig").is_none());
     }
 
     #[test]
     fn wire_request_omits_generation_config_when_empty() {
         let req = ChatRequest {
             model: "m".into(),
-            messages: vec![ChatMessage {
-                role: ChatRole::User,
-                content: "hi".into(),
-            }],
+            messages: vec![ChatMessage::text(ChatRole::User, "hi")],
             temperature: None,
             max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
         };
-        let wire = WireGenerateContentRequest::from_request(&req);
+        let wire = WireGenerateContentRequest::try_from_request(&req).unwrap();
         let json = serde_json::to_value(&wire).unwrap();
         assert!(json.get("generationConfig").is_none());
         assert!(json.get("systemInstruction").is_none());
+    }
+
+    #[test]
+    fn reasoning_none_auto_off_on_level_and_budget() {
+        let base = |model: &str, policy: Option<ReasoningPolicy>| ChatRequest {
+            model: model.into(),
+            messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens: None,
+            reasoning: policy,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let none_json = serde_json::to_value(
+            WireGenerateContentRequest::try_from_request(&base("gemini-3-pro", None)).unwrap(),
+        )
+        .unwrap();
+        assert!(none_json.get("generationConfig").is_none());
+
+        let auto_json = serde_json::to_value(
+            WireGenerateContentRequest::try_from_request(&base(
+                "gemini-3-pro",
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::Auto,
+                    effort: Some(ReasoningEffort::High),
+                    budget_tokens: Some(1000),
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(auto_json.get("generationConfig").is_none());
+
+        let off_json = serde_json::to_value(
+            WireGenerateContentRequest::try_from_request(&base(
+                "gemini-3-pro",
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::Off,
+                    effort: None,
+                    budget_tokens: None,
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            off_json["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            0
+        );
+
+        // On + none → thinkingLevel medium (non-2.5)
+        let on_def = serde_json::to_value(
+            WireGenerateContentRequest::try_from_request(&base(
+                "gemini-3-pro",
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::On,
+                    effort: None,
+                    budget_tokens: None,
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            on_def["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "medium"
+        );
+        assert_eq!(
+            on_def["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+
+        // On + effort high → level high
+        let on_high = serde_json::to_value(
+            WireGenerateContentRequest::try_from_request(&base(
+                "gemini-3-pro",
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::On,
+                    effort: Some(ReasoningEffort::High),
+                    budget_tokens: None,
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            on_high["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+
+        // budget path for 2.5 model On+none → budget 4096
+        let budget_def = serde_json::to_value(
+            WireGenerateContentRequest::try_from_request(&base(
+                "gemini-2.5-pro",
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::On,
+                    effort: None,
+                    budget_tokens: None,
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            budget_def["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            4096
+        );
+
+        // budget takes precedence
+        let budget_wins = serde_json::to_value(
+            WireGenerateContentRequest::try_from_request(&base(
+                "gemini-3-pro",
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::On,
+                    effort: Some(ReasoningEffort::High),
+                    budget_tokens: Some(2000),
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            budget_wins["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            2000
+        );
+        assert!(budget_wins["generationConfig"]["thinkingConfig"]
+            .get("thinkingLevel")
+            .is_none());
+    }
+
+    #[test]
+    fn multimodal_inline_data_and_image_url_unsupported() {
+        use crate::types::{ChatMessage, ContentPart};
+
+        let text_only = ChatRequest {
+            model: "gemini-2.0-flash".into(),
+            messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let json =
+            serde_json::to_value(WireGenerateContentRequest::try_from_request(&text_only).unwrap())
+                .unwrap();
+        assert_eq!(json["contents"][0]["parts"][0]["text"], "hi");
+
+        let with_b64 = ChatRequest {
+            model: "gemini-2.0-flash".into(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                parts: vec![
+                    ContentPart::Text { text: "see".into() },
+                    ContentPart::ImageBase64 {
+                        media_type: "image/png".into(),
+                        data: "aGVsbG8=".into(),
+                    },
+                ],
+                tool_call_id: None,
+                tool_calls: vec![],
+            }],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let json =
+            serde_json::to_value(WireGenerateContentRequest::try_from_request(&with_b64).unwrap())
+                .unwrap();
+        assert_eq!(json["contents"][0]["parts"][0]["text"], "see");
+        assert_eq!(
+            json["contents"][0]["parts"][1]["inline_data"]["mime_type"],
+            "image/png"
+        );
+        assert_eq!(
+            json["contents"][0]["parts"][1]["inline_data"]["data"],
+            "aGVsbG8="
+        );
+
+        let with_url = ChatRequest {
+            model: "gemini-2.0-flash".into(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                parts: vec![
+                    ContentPart::Text { text: "see".into() },
+                    ContentPart::ImageUrl {
+                        url: "https://example.com/a.png".into(),
+                        detail: None,
+                    },
+                ],
+                tool_call_id: None,
+                tool_calls: vec![],
+            }],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let err = WireGenerateContentRequest::try_from_request(&with_url).unwrap_err();
+        assert_eq!(err.kind, ProtocolErrorKind::Unsupported);
+        assert!(
+            GeminiGenerateContentAdapter::new()
+                .unwrap()
+                .capabilities()
+                .vision_input
+        );
     }
 
     #[test]
@@ -534,8 +1008,9 @@ mod tests {
             protocol: ProtocolKind::GeminiGenerateContent,
             base_url: base.clone(),
             api_key: SecretString::new("AIza-test"),
+            auth: Default::default(),
         };
-        let headers = GeminiGenerateContentAdapter::auth_headers(&with_key, true);
+        let headers = GeminiGenerateContentAdapter::auth_headers(&with_key, true).unwrap();
         assert_eq!(
             headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()),
             Some("AIza-test")
@@ -546,8 +1021,9 @@ mod tests {
             protocol: ProtocolKind::GeminiGenerateContent,
             base_url: base,
             api_key: SecretString::new(""),
+            auth: Default::default(),
         };
-        let headers = GeminiGenerateContentAdapter::auth_headers(&no_key, false);
+        let headers = GeminiGenerateContentAdapter::auth_headers(&no_key, false).unwrap();
         assert!(!headers.contains_key("x-goog-api-key"));
     }
 
@@ -555,7 +1031,7 @@ mod tests {
     fn parse_gemini_error_uses_status() {
         let body =
             r#"{"error":{"code":401,"message":"bad key AIza-secret","status":"UNAUTHENTICATED"}}"#;
-        let (msg, code) = parse_gemini_error_body(body);
+        let (msg, code) = crate::error::parse_gemini_error_body(body);
         assert_eq!(code.as_deref(), Some("UNAUTHENTICATED"));
         assert!(msg.is_some());
     }

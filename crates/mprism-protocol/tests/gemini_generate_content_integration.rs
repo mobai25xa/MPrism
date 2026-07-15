@@ -114,17 +114,14 @@ async fn stream_chat_happy_path_and_request_shape() {
     let request = ChatRequest {
         model: "gemini-flash".into(),
         messages: vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: "sys".into(),
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: "hi".into(),
-            },
+            ChatMessage::text(ChatRole::System, "sys"),
+            ChatMessage::text(ChatRole::User, "hi"),
         ],
         temperature: Some(0.2),
         max_tokens: Some(64),
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
     let mut content = String::new();
@@ -141,8 +138,9 @@ async fn stream_chat_happy_path_and_request_shape() {
             }
             StreamEvent::Completed { finish_reason } => {
                 completed = true;
-                assert_eq!(finish_reason.as_deref(), Some("STOP"));
+                assert_eq!(finish_reason, mprism_protocol::FinishReason::Stop);
             }
+            StreamEvent::ToolCallDelta { .. } | StreamEvent::ToolCallFinished { .. } => {}
         }
     }
     assert_eq!(content, "Hello");
@@ -170,12 +168,12 @@ async fn stream_chat_handles_crlf() {
     let ep = endpoint(&format!("{}/v1beta", server.uri()), "");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: None,
         max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
     let mut content = String::new();
@@ -207,12 +205,12 @@ async fn stream_chat_unexpected_eof() {
     let ep = endpoint(&format!("{}/v1beta", server.uri()), "k");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: None,
         max_tokens: Some(16),
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
     let mut saw_eof = false;
@@ -253,12 +251,12 @@ async fn stream_chat_http_error() {
     let ep = endpoint(&format!("{}/v1beta", server.uri()), "k");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: None,
         max_tokens: Some(16),
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let result = adapter.stream_chat(&ep, request).await;
     let err = match result {
@@ -269,4 +267,86 @@ async fn stream_chat_http_error() {
     assert_eq!(err.provider_code.as_deref(), Some("RESOURCE_EXHAUSTED"));
     assert_eq!(err.request_id.as_deref(), Some("req_g"));
     assert!(err.retryable);
+}
+
+#[tokio::test]
+async fn stream_chat_finish_reasons() {
+    for (reason, expected) in [
+        ("STOP", mprism_protocol::FinishReason::Stop),
+        ("MAX_TOKENS", mprism_protocol::FinishReason::Length),
+        ("SAFETY", mprism_protocol::FinishReason::ContentFilter),
+    ] {
+        let server = MockServer::start().await;
+        let body = format!(
+            "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"x\"}}]}},\"finishReason\":\"{reason}\",\"index\":0}}]}}\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/m:streamGenerateContent"))
+            .and(query_param("alt", "sse"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let adapter = GeminiGenerateContentAdapter::new().unwrap();
+        let ep = endpoint(&format!("{}/v1beta", server.uri()), "k");
+        let request = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens: Some(16),
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
+        let mut finished = None;
+        let mut n = 0usize;
+        while let Some(item) = stream.next().await {
+            if let StreamEvent::Completed { finish_reason } = item.unwrap() {
+                n += 1;
+                finished = Some(finish_reason);
+            }
+        }
+        assert_eq!(n, 1);
+        assert_eq!(finished, Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn stream_chat_drop_without_completed() {
+    let server = MockServer::start().await;
+    let body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]},\"index\":0}]}\n\n",
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\",\"index\":0}]}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/m:streamGenerateContent"))
+        .and(query_param("alt", "sse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let adapter = GeminiGenerateContentAdapter::new().unwrap();
+    let ep = endpoint(&format!("{}/v1beta", server.uri()), "k");
+    let request = ChatRequest {
+        model: "m".into(),
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+        temperature: None,
+        max_tokens: Some(16),
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
+    let first = stream.next().await.unwrap().unwrap();
+    assert!(matches!(first, StreamEvent::ContentDelta { .. }));
+    drop(stream);
 }

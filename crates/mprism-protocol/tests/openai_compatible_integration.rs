@@ -2,10 +2,10 @@
 
 use futures_util::StreamExt;
 use mprism_protocol::{
-    ChatMessage, ChatRequest, ChatRole, OpenAiCompatibleAdapter, ProtocolAdapter,
+    AuthOptions, ChatMessage, ChatRequest, ChatRole, OpenAiCompatibleAdapter, ProtocolAdapter,
     ProtocolErrorKind, ProtocolKind, ProviderEndpoint, StreamEvent,
 };
-use wiremock::matchers::{header, header_exists, method, path};
+use wiremock::matchers::{header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn endpoint(base: &str, key: &str) -> ProviderEndpoint {
@@ -124,12 +124,12 @@ async fn stream_chat_content_reasoning_usage_and_done() {
     let ep = endpoint(&format!("{}/v1", server.uri()), "sk-test");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: Some(0.2),
         max_tokens: Some(64),
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
     let mut content = String::new();
@@ -146,8 +146,9 @@ async fn stream_chat_content_reasoning_usage_and_done() {
             }
             StreamEvent::Completed { finish_reason } => {
                 completed = true;
-                assert_eq!(finish_reason.as_deref(), Some("stop"));
+                assert_eq!(finish_reason, mprism_protocol::FinishReason::Stop);
             }
+            StreamEvent::ToolCallDelta { .. } | StreamEvent::ToolCallFinished { .. } => {}
         }
     }
     assert_eq!(content, "Hello");
@@ -175,12 +176,12 @@ async fn stream_chat_handles_chunked_and_crlf() {
     let ep = endpoint(&format!("{}/v1", server.uri()), "");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: None,
         max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
     let mut content = String::new();
@@ -210,12 +211,12 @@ async fn stream_chat_unexpected_eof() {
     let ep = endpoint(&format!("{}/v1", server.uri()), "k");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: None,
         max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
     let mut saw_content = false;
@@ -239,9 +240,14 @@ async fn stream_chat_rate_limited() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
-            "error": {"message": "Rate limit reached", "code": "rate_limit_exceeded"}
-        })))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "7")
+                .insert_header("x-request-id", "req_rate_1")
+                .set_body_json(serde_json::json!({
+                    "error": {"message": "Rate limit reached", "code": "rate_limit_exceeded"}
+                })),
+        )
         .mount(&server)
         .await;
 
@@ -249,12 +255,12 @@ async fn stream_chat_rate_limited() {
     let ep = endpoint(&format!("{}/v1", server.uri()), "k");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: None,
         max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let err = match adapter.stream_chat(&ep, request).await {
         Ok(_) => panic!("expected error"),
@@ -263,6 +269,66 @@ async fn stream_chat_rate_limited() {
     assert_eq!(err.kind, ProtocolErrorKind::RateLimited);
     assert!(err.retryable);
     assert_eq!(err.http_status, Some(429));
+    assert_eq!(err.retry_after_ms, Some(7_000));
+    assert_eq!(err.request_id.as_deref(), Some("req_rate_1"));
+}
+
+#[tokio::test]
+async fn stream_chat_context_length_exceeded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {
+                "message": "This model's maximum context length is 8192 tokens",
+                "code": "context_length_exceeded"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let adapter = OpenAiCompatibleAdapter::new().unwrap();
+    let ep = endpoint(&format!("{}/v1", server.uri()), "k");
+    let request = ChatRequest {
+        model: "m".into(),
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+        temperature: None,
+        max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let err = match adapter.stream_chat(&ep, request).await {
+        Ok(_) => panic!("expected error"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind, ProtocolErrorKind::ContextLengthExceeded);
+    assert!(!err.retryable);
+}
+
+#[tokio::test]
+async fn list_models_sends_extra_headers_and_api_key_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("Authorization", "Bearer sk-test"))
+        .and(header("X-Custom-Client", "mprism"))
+        .and(query_param("api_key", "sk-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "m1"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let adapter = OpenAiCompatibleAdapter::new().unwrap();
+    let mut ep = endpoint(&format!("{}/v1", server.uri()), "sk-test");
+    ep.auth = AuthOptions {
+        extra_headers: vec![("X-Custom-Client".into(), "mprism".into())],
+        api_key_query_param: Some("api_key".into()),
+    };
+    let models = adapter.list_models(&ep).await.unwrap();
+    assert_eq!(models[0].id, "m1");
 }
 
 #[tokio::test]
@@ -278,12 +344,12 @@ async fn stream_chat_provider_5xx() {
     let ep = endpoint(&format!("{}/v1", server.uri()), "k");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: None,
         max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let err = match adapter.stream_chat(&ep, request).await {
         Ok(_) => panic!("expected error"),
@@ -302,4 +368,206 @@ async fn rejects_base_url_with_query() {
     )
     .unwrap_err();
     assert_eq!(err.kind, ProtocolErrorKind::InvalidConfiguration);
+}
+
+#[tokio::test]
+async fn stream_chat_finish_reason_length() {
+    let server = MockServer::start().await;
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"length\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let adapter = OpenAiCompatibleAdapter::new().unwrap();
+    let ep = endpoint(&format!("{}/v1", server.uri()), "k");
+    let request = ChatRequest {
+        model: "m".into(),
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+        temperature: None,
+        max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
+    let mut finished = None;
+    while let Some(item) = stream.next().await {
+        if let StreamEvent::Completed { finish_reason } = item.unwrap() {
+            finished = Some(finish_reason);
+        }
+    }
+    assert_eq!(finished, Some(mprism_protocol::FinishReason::Length));
+}
+
+#[tokio::test]
+async fn stream_chat_finish_reason_content_filter_and_tool_calls() {
+    for (raw, expected) in [
+        (
+            "content_filter",
+            mprism_protocol::FinishReason::ContentFilter,
+        ),
+        ("tool_calls", mprism_protocol::FinishReason::ToolCalls),
+    ] {
+        let server = MockServer::start().await;
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{raw}\"}}]}}\n\ndata: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let adapter = OpenAiCompatibleAdapter::new().unwrap();
+        let ep = endpoint(&format!("{}/v1", server.uri()), "k");
+        let request = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
+        let mut finished = None;
+        let mut completed_count = 0usize;
+        while let Some(item) = stream.next().await {
+            if let StreamEvent::Completed { finish_reason } = item.unwrap() {
+                completed_count += 1;
+                finished = Some(finish_reason);
+            }
+        }
+        assert_eq!(completed_count, 1);
+        assert_eq!(finished, Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn stream_chat_sends_stream_options_include_usage() {
+    use wiremock::matchers::body_partial_json;
+    let server = MockServer::start().await;
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let adapter = OpenAiCompatibleAdapter::new().unwrap();
+    let ep = endpoint(&format!("{}/v1", server.uri()), "k");
+    let request = ChatRequest {
+        model: "m".into(),
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+        temperature: None,
+        max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
+    let mut completed = false;
+    while let Some(item) = stream.next().await {
+        if matches!(item.unwrap(), StreamEvent::Completed { .. }) {
+            completed = true;
+        }
+    }
+    assert!(completed);
+}
+
+#[tokio::test]
+async fn stream_chat_idle_timeout() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Headers OK, then body stalls: idle timeout applies to stream bytes (§5).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 8192];
+        let _ = socket.read(&mut buf).await;
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let _ = socket.write_all(headers).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let adapter =
+        OpenAiCompatibleAdapter::with_stream_idle_timeout(Duration::from_millis(300)).unwrap();
+    let ep = endpoint(&format!("http://{addr}/v1"), "k");
+    let request = ChatRequest {
+        model: "m".into(),
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+        temperature: None,
+        max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
+    let item = stream.next().await.expect("timeout event");
+    let err = item.expect_err("expected timeout error");
+    assert_eq!(err.kind, ProtocolErrorKind::Timeout);
+    assert!(err.retryable);
+}
+
+#[tokio::test]
+async fn stream_chat_drop_without_completed() {
+    let server = MockServer::start().await;
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        // No [DONE]; client will drop after first delta.
+        "data: {\"choices\":[{\"delta\":{\"content\":\"more\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let adapter = OpenAiCompatibleAdapter::new().unwrap();
+    let ep = endpoint(&format!("{}/v1", server.uri()), "k");
+    let request = ChatRequest {
+        model: "m".into(),
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+        temperature: None,
+        max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
+    let first = stream.next().await.unwrap().unwrap();
+    assert!(matches!(first, StreamEvent::ContentDelta { .. }));
+    // Drop stream: must not invent Completed{Stop}.
+    drop(stream);
 }

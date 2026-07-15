@@ -1,7 +1,9 @@
 //! Protocol adapter trait.
 
 use crate::error::ProtocolError;
-use crate::types::{ChatRequest, ModelInfo, ProtocolKind, ProviderEndpoint, StreamEvent};
+use crate::types::{
+    ChatRequest, ModelInfo, ProtocolCapabilities, ProtocolKind, ProviderEndpoint, StreamEvent,
+};
 use async_trait::async_trait;
 use futures_core::Stream;
 use std::pin::Pin;
@@ -14,12 +16,18 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProtocolErro
 pub trait ProtocolAdapter: Send + Sync {
     fn kind(&self) -> ProtocolKind;
 
+    /// Declared capabilities; must match real encode/decode support.
+    fn capabilities(&self) -> ProtocolCapabilities;
+
     async fn list_models(
         &self,
         endpoint: &ProviderEndpoint,
     ) -> Result<Vec<ModelInfo>, ProtocolError>;
 
     /// Start a streaming chat request.
+    ///
+    /// Implementations should call `request.validate()` and
+    /// `request.check_capabilities(&self.capabilities())` before HTTP.
     ///
     /// A successful return only means the HTTP response body is ready to read.
     /// Stream items may still yield protocol, timeout, or decode errors.

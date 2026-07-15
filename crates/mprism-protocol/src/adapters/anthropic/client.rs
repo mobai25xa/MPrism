@@ -2,13 +2,12 @@
 
 use super::sse_events::{decode_sse_data, EventDecodeState};
 use crate::adapter::{ChatStream, ProtocolAdapter};
-use crate::error::{
-    kind_from_status, parse_provider_error_body, redact_secrets, ProtocolError, ProtocolErrorKind,
-    ERROR_BODY_LIMIT,
-};
+use crate::auth::{apply_api_key_query, merge_extra_headers};
+use crate::error::{map_http_error, ErrorBodyFamily, ProtocolError, ProtocolErrorKind};
 use crate::sse::SseParser;
 use crate::types::{
-    join_api_path, ChatRequest, ChatRole, ModelInfo, ProtocolKind, ProviderEndpoint, StreamEvent,
+    join_api_path, ChatRequest, ChatRole, ModelInfo, ProtocolCapabilities, ProtocolKind,
+    ProviderEndpoint, StreamEvent,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -21,7 +20,8 @@ use tokio::time::timeout;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Stream idle timeout (no body bytes): model-protocol-sdk §5.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Anthropic requires `max_tokens`; used when ChatRequest omits it.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -30,11 +30,17 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 #[derive(Debug, Clone)]
 pub struct AnthropicMessagesAdapter {
     client: Client,
+    stream_idle_timeout: Duration,
 }
 
 impl AnthropicMessagesAdapter {
     /// Create an adapter with default HTTP timeouts.
     pub fn new() -> Result<Self, ProtocolError> {
+        Self::with_stream_idle_timeout(STREAM_IDLE_TIMEOUT)
+    }
+
+    /// Create an adapter with a custom stream idle timeout (tests / specialized hosts).
+    pub fn with_stream_idle_timeout(stream_idle_timeout: Duration) -> Result<Self, ProtocolError> {
         let client = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
@@ -44,10 +50,16 @@ impl AnthropicMessagesAdapter {
                     format!("创建 HTTP 客户端失败: {err}"),
                 )
             })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            stream_idle_timeout,
+        })
     }
 
-    fn auth_headers(endpoint: &ProviderEndpoint, accept_event_stream: bool) -> HeaderMap {
+    fn auth_headers(
+        endpoint: &ProviderEndpoint,
+        accept_event_stream: bool,
+    ) -> Result<HeaderMap, ProtocolError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if let Ok(v) = HeaderValue::from_str(ANTHROPIC_VERSION) {
@@ -63,41 +75,15 @@ impl AnthropicMessagesAdapter {
                 headers.insert(HeaderName::from_static("x-api-key"), v);
             }
         }
-        headers
+        merge_extra_headers(&mut headers, &endpoint.auth)?;
+        Ok(headers)
     }
 
     async fn map_error_response(response: Response) -> ProtocolError {
-        let status = response.status();
-        let request_id = response
-            .headers()
-            .get("request-id")
-            .or_else(|| response.headers().get("x-request-id"))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let kind = kind_from_status(status.as_u16());
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let bytes = response.bytes().await.unwrap_or_default();
-        let limited = if bytes.len() > ERROR_BODY_LIMIT {
-            &bytes[..ERROR_BODY_LIMIT]
-        } else {
-            &bytes
-        };
-        let body = String::from_utf8_lossy(limited);
-        let (message, code) = parse_anthropic_error_body(&body);
-        let message = message.unwrap_or_else(|| {
-            if body.trim().is_empty() {
-                format!("服务商返回 HTTP {}", status.as_u16())
-            } else {
-                redact_secrets(body.trim())
-            }
-        });
-        let mut err = ProtocolError::new(kind, message).with_http_status(status.as_u16());
-        if let Some(code) = code {
-            err = err.with_provider_code(code);
-        }
-        if let Some(id) = request_id {
-            err = err.with_request_id(id);
-        }
-        err
+        map_http_error(status, &headers, &bytes, ErrorBodyFamily::Anthropic)
     }
 }
 
@@ -113,6 +99,20 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
         ProtocolKind::AnthropicMessages
     }
 
+    fn capabilities(&self) -> ProtocolCapabilities {
+        ProtocolCapabilities {
+            streaming: true,
+            list_models: true,
+            reasoning_output: true,
+            reasoning_control: true,
+            tools: true,
+            vision_input: true,
+            stream_usage: true,
+            custom_headers: true,
+            api_key_query: true,
+        }
+    }
+
     async fn list_models(
         &self,
         endpoint: &ProviderEndpoint,
@@ -124,11 +124,11 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
             ));
         }
 
-        let url = join_api_path(&endpoint.base_url, "models")?;
+        let url = apply_api_key_query(join_api_path(&endpoint.base_url, "models")?, endpoint);
         let request = self
             .client
             .get(url)
-            .headers(Self::auth_headers(endpoint, false));
+            .headers(Self::auth_headers(endpoint, false)?);
 
         let response = timeout(LIST_TIMEOUT, request.send())
             .await
@@ -162,13 +162,14 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
             ));
         }
         request.validate()?;
+        request.check_capabilities(&self.capabilities())?;
 
-        let url = join_api_path(&endpoint.base_url, "messages")?;
-        let wire = WireMessagesRequest::from_request(&request);
+        let url = apply_api_key_query(join_api_path(&endpoint.base_url, "messages")?, endpoint);
+        let wire = WireMessagesRequest::try_from_request(&request)?;
         let http_request = self
             .client
             .post(url)
-            .headers(Self::auth_headers(endpoint, true))
+            .headers(Self::auth_headers(endpoint, true)?)
             .json(&wire);
 
         let response = http_request.send().await.map_err(map_reqwest_error)?;
@@ -177,14 +178,16 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
         }
 
         let mut byte_stream = response.bytes_stream();
+        let idle = self.stream_idle_timeout;
         let stream = async_stream::stream! {
             let mut parser = SseParser::new();
             let mut decode_state = EventDecodeState::default();
             let mut completed = false;
             let mut failed = false;
 
+            // Dropping this stream cancels further polling and does not fabricate Completed (§3.8).
             while !completed && !failed {
-                let next = timeout(STREAM_IDLE_TIMEOUT, byte_stream.next()).await;
+                let next = timeout(idle, byte_stream.next()).await;
                 match next {
                     Err(_) => {
                         failed = true;
@@ -261,22 +264,6 @@ fn map_reqwest_error(err: reqwest::Error) -> ProtocolError {
     ProtocolError::new(ProtocolErrorKind::Transport, format!("网络错误: {err}"))
 }
 
-/// Parse Anthropic error JSON; prefer `error.type` as provider code.
-fn parse_anthropic_error_body(body: &str) -> (Option<String>, Option<String>) {
-    let (message, openai_code) = parse_provider_error_body(body);
-    let value: Value = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(_) => return (message, openai_code),
-    };
-    let code = value
-        .get("error")
-        .and_then(|e| e.get("type"))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .or(openai_code);
-    (message, code)
-}
-
 fn parse_models_body(body: &[u8]) -> Result<Vec<ModelInfo>, ProtocolError> {
     let value: Value = serde_json::from_slice(body).map_err(|err| {
         ProtocolError::new(
@@ -323,36 +310,121 @@ fn parse_models_body(body: &[u8]) -> Result<Vec<ModelInfo>, ProtocolError> {
 struct WireMessagesRequest {
     model: String,
     max_tokens: u32,
-    messages: Vec<WireChatMessage>,
+    messages: Vec<Value>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// Manual extended thinking (default V2 path). Adaptive is not auto-selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<WireThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<WireAnthropicTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
-struct WireChatMessage {
-    role: String,
-    content: String,
+struct WireThinking {
+    #[serde(rename = "type")]
+    thinking_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
+    /// V2 default when enabled so thinking_delta produces ReasoningDelta.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WireAnthropicTool {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    input_schema: Value,
 }
 
 impl WireMessagesRequest {
-    fn from_request(request: &ChatRequest) -> Self {
+    fn try_from_request(request: &ChatRequest) -> Result<Self, ProtocolError> {
+        let max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let thinking = encode_anthropic_thinking(request.reasoning.as_ref(), max_tokens)?;
+        // Extended thinking + Required/Named tool_choice is rejected before HTTP (mapping §4).
+        if thinking
+            .as_ref()
+            .map(|t| t.thinking_type == "enabled")
+            .unwrap_or(false)
+        {
+            if let Some(choice) = &request.tool_choice {
+                use crate::types::ToolChoice;
+                if matches!(choice, ToolChoice::Required | ToolChoice::Named { .. }) {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorKind::InvalidRequest,
+                        "Anthropic extended thinking 启用时 tool_choice 仅允许 Auto 或 None",
+                    ));
+                }
+            }
+        }
+
         let mut system_parts = Vec::new();
         let mut messages = Vec::new();
         for m in &request.messages {
             match m.role {
                 ChatRole::System => {
-                    if !m.content.is_empty() {
-                        system_parts.push(m.content.clone());
+                    if !m.text_content().is_empty() {
+                        system_parts.push(m.text_content());
                     }
                 }
-                ChatRole::User | ChatRole::Assistant => {
-                    messages.push(WireChatMessage {
-                        role: m.role.as_str().to_string(),
-                        content: m.content.clone(),
-                    });
+                ChatRole::User => {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": encode_anthropic_content(m)?,
+                    }));
+                }
+                ChatRole::Assistant => {
+                    if m.tool_calls.is_empty() {
+                        messages.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": encode_anthropic_content(m)?,
+                        }));
+                    } else {
+                        let mut blocks = encode_anthropic_content_blocks(m)?;
+                        for tc in &m.tool_calls {
+                            let input = serde_json::from_str::<Value>(&tc.arguments)
+                                .unwrap_or_else(|_| Value::String(tc.arguments.clone()));
+                            blocks.push(serde_json::json!({
+                                "type": "tool_use",
+                                "id": tc.id,
+                                "name": tc.name,
+                                "input": input,
+                            }));
+                        }
+                        messages.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": blocks,
+                        }));
+                    }
+                }
+                ChatRole::Tool => {
+                    let tool_use_id = m
+                        .tool_call_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            ProtocolError::new(
+                                ProtocolErrorKind::InvalidRequest,
+                                "Tool 消息必须提供 tool_call_id",
+                            )
+                        })?;
+                    // Anthropic: tool_result lives inside a user message.
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": m.text_content(),
+                        }],
+                    }));
                 }
             }
         }
@@ -361,14 +433,189 @@ impl WireMessagesRequest {
         } else {
             Some(system_parts.join("\n\n"))
         };
-        Self {
+        let tools = encode_anthropic_tools(request.tools.as_ref());
+        let tool_choice =
+            encode_anthropic_tool_choice(request.tool_choice.as_ref(), tools.is_some());
+        Ok(Self {
             model: request.model.trim().to_string(),
-            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            max_tokens,
             messages,
             stream: true,
             system,
             temperature: request.temperature,
+            thinking,
+            tools,
+            tool_choice,
+        })
+    }
+}
+
+/// mapping-v2 §5: Text / ImageBase64 / ImageUrl content blocks.
+/// Pure single-text messages stay string-shaped for V1 compatibility.
+fn encode_anthropic_content(message: &crate::types::ChatMessage) -> Result<Value, ProtocolError> {
+    use crate::types::ContentPart;
+    let has_image = message.parts.iter().any(|p| {
+        matches!(
+            p,
+            ContentPart::ImageUrl { .. } | ContentPart::ImageBase64 { .. }
+        )
+    });
+    let multi_text = message
+        .parts
+        .iter()
+        .filter(|p| matches!(p, ContentPart::Text { .. }))
+        .count()
+        > 1;
+    if !has_image && !multi_text {
+        return Ok(Value::String(message.text_content()));
+    }
+    Ok(Value::Array(encode_anthropic_content_blocks(message)?))
+}
+
+fn encode_anthropic_content_blocks(
+    message: &crate::types::ChatMessage,
+) -> Result<Vec<Value>, ProtocolError> {
+    use crate::types::ContentPart;
+    let mut blocks = Vec::with_capacity(message.parts.len());
+    for part in &message.parts {
+        match part {
+            ContentPart::Text { text } => {
+                if text.is_empty() {
+                    continue;
+                }
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": text,
+                }));
+            }
+            ContentPart::ImageBase64 { media_type, data } => {
+                let data: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+                blocks.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type.trim(),
+                        "data": data,
+                    }
+                }));
+            }
+            ContentPart::ImageUrl { url, .. } => {
+                blocks.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "url",
+                        "url": url,
+                    }
+                }));
+            }
         }
+    }
+    if blocks.is_empty() && message.tool_calls.is_empty() {
+        return Err(ProtocolError::new(
+            ProtocolErrorKind::InvalidRequest,
+            "消息 content 编码结果为空",
+        ));
+    }
+    Ok(blocks)
+}
+
+fn encode_anthropic_tools(
+    tools: Option<&Vec<crate::types::ToolDefinition>>,
+) -> Option<Vec<WireAnthropicTool>> {
+    tools.map(|tools| {
+        tools
+            .iter()
+            .map(|t| WireAnthropicTool {
+                name: t.name.trim().to_string(),
+                description: t.description.clone(),
+                input_schema: t.parameters.clone(),
+            })
+            .collect()
+    })
+}
+
+fn encode_anthropic_tool_choice(
+    choice: Option<&crate::types::ToolChoice>,
+    has_tools: bool,
+) -> Option<Value> {
+    use crate::types::ToolChoice;
+    match choice {
+        None if has_tools => Some(serde_json::json!({ "type": "auto" })),
+        None => None,
+        Some(ToolChoice::Auto) => Some(serde_json::json!({ "type": "auto" })),
+        Some(ToolChoice::None) => Some(serde_json::json!({ "type": "none" })),
+        Some(ToolChoice::Required) => Some(serde_json::json!({ "type": "any" })),
+        Some(ToolChoice::Named { name }) => Some(serde_json::json!({
+            "type": "tool",
+            "name": name,
+        })),
+    }
+}
+
+/// Manual extended thinking per mapping-v2 §3.1 / §3.3 / §3.4 (default path).
+///
+/// Adaptive + output_config.effort is not selected automatically in V2.
+fn encode_anthropic_thinking(
+    policy: Option<&crate::types::ReasoningPolicy>,
+    max_tokens: u32,
+) -> Result<Option<WireThinking>, ProtocolError> {
+    use crate::types::ReasoningMode;
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    match policy.mode {
+        ReasoningMode::Auto => Ok(None),
+        ReasoningMode::Off => Ok(Some(WireThinking {
+            thinking_type: "disabled".into(),
+            budget_tokens: None,
+            display: None,
+        })),
+        ReasoningMode::On => {
+            // budget takes precedence over effort when both present.
+            let budget = if let Some(n) = policy.budget_tokens {
+                n
+            } else if let Some(effort) = policy.effort {
+                effort_to_manual_budget(effort)
+            } else {
+                4096
+            };
+            if budget > 0 && budget < 1024 {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::InvalidRequest,
+                    "Anthropic budget_tokens 必须 ≥ 1024（或为 0 仅用于关闭路径）",
+                ));
+            }
+            if budget == 0 {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::InvalidRequest,
+                    "Anthropic On 模式 budget_tokens 不能为 0",
+                ));
+            }
+            // Non-interleaved: budget must be < max_tokens.
+            if budget >= max_tokens {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::InvalidRequest,
+                    format!(
+                        "Anthropic budget_tokens ({budget}) 必须小于 max_tokens ({max_tokens})"
+                    ),
+                ));
+            }
+            Ok(Some(WireThinking {
+                thinking_type: "enabled".into(),
+                budget_tokens: Some(budget),
+                display: Some("summarized".into()),
+            }))
+        }
+    }
+}
+
+fn effort_to_manual_budget(effort: crate::types::ReasoningEffort) -> u32 {
+    use crate::types::ReasoningEffort;
+    match effort {
+        ReasoningEffort::Minimal | ReasoningEffort::Low => 1024,
+        ReasoningEffort::Medium => 4096,
+        ReasoningEffort::High => 16384,
+        ReasoningEffort::XHigh | ReasoningEffort::Max => 32000,
     }
 }
 
@@ -376,12 +623,85 @@ impl WireMessagesRequest {
 mod tests {
     use super::*;
     use crate::secret::SecretString;
-    use crate::types::{normalize_base_url, ChatMessage};
+    use crate::types::{
+        normalize_base_url, ChatMessage, ReasoningEffort, ReasoningMode, ReasoningPolicy,
+    };
 
     #[test]
     fn kind_is_anthropic_messages() {
         let adapter = AnthropicMessagesAdapter::new().unwrap();
         assert_eq!(adapter.kind(), ProtocolKind::AnthropicMessages);
+        let caps = adapter.capabilities();
+        assert!(caps.reasoning_control);
+        assert!(caps.reasoning_output);
+        assert!(caps.tools);
+        assert!(caps.vision_input);
+        assert!(caps.stream_usage);
+        assert!(caps.custom_headers);
+        assert!(caps.api_key_query);
+    }
+
+    #[test]
+    fn tools_wire_and_thinking_named_conflict() {
+        use crate::types::{ToolChoice, ToolDefinition};
+        let tools = vec![ToolDefinition {
+            name: "lookup".into(),
+            description: Some("d".into()),
+            parameters: serde_json::json!({"type":"object"}),
+        }];
+        let ok = ChatRequest {
+            model: "m".into(),
+            messages: vec![
+                ChatMessage::text(ChatRole::User, "hi"),
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    parts: vec![],
+                    tool_call_id: None,
+                    tool_calls: vec![crate::types::ToolCall {
+                        id: "tu_1".into(),
+                        name: "lookup".into(),
+                        arguments: r#"{"q":1}"#.into(),
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    parts: vec![crate::types::ContentPart::Text { text: "ok".into() }],
+                    tool_call_id: Some("tu_1".into()),
+                    tool_calls: vec![],
+                },
+            ],
+            temperature: None,
+            max_tokens: Some(8192),
+            reasoning: None,
+            tools: Some(tools.clone()),
+            tool_choice: Some(ToolChoice::Auto),
+        };
+        let json =
+            serde_json::to_value(WireMessagesRequest::try_from_request(&ok).unwrap()).unwrap();
+        assert_eq!(json["tools"][0]["name"], "lookup");
+        assert_eq!(json["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(json["tool_choice"]["type"], "auto");
+        assert_eq!(json["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(json["messages"][2]["role"], "user");
+        assert_eq!(json["messages"][2]["content"][0]["type"], "tool_result");
+
+        let conflict = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens: Some(8192),
+            reasoning: Some(ReasoningPolicy {
+                mode: ReasoningMode::On,
+                effort: None,
+                budget_tokens: Some(1024),
+            }),
+            tools: Some(tools),
+            tool_choice: Some(ToolChoice::Named {
+                name: "lookup".into(),
+            }),
+        };
+        let err = WireMessagesRequest::try_from_request(&conflict).unwrap_err();
+        assert_eq!(err.kind, ProtocolErrorKind::InvalidRequest);
     }
 
     #[test]
@@ -389,19 +709,16 @@ mod tests {
         let req = ChatRequest {
             model: "claude".into(),
             messages: vec![
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: "sys".into(),
-                },
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: "hi".into(),
-                },
+                ChatMessage::text(ChatRole::System, "sys"),
+                ChatMessage::text(ChatRole::User, "hi"),
             ],
             temperature: Some(0.5),
             max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
         };
-        let wire = WireMessagesRequest::from_request(&req);
+        let wire = WireMessagesRequest::try_from_request(&req).unwrap();
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json["stream"], true);
         assert_eq!(json["max_tokens"], 4096);
@@ -410,24 +727,222 @@ mod tests {
         assert_eq!(json["messages"].as_array().unwrap().len(), 1);
         assert_eq!(json["messages"][0]["role"], "user");
         assert!(json.get("tools").is_none());
+        assert!(json.get("thinking").is_none());
     }
 
     #[test]
     fn wire_request_uses_explicit_max_tokens() {
         let req = ChatRequest {
             model: "m".into(),
-            messages: vec![ChatMessage {
-                role: ChatRole::User,
-                content: "hi".into(),
-            }],
+            messages: vec![ChatMessage::text(ChatRole::User, "hi")],
             temperature: None,
             max_tokens: Some(128),
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
         };
-        let wire = WireMessagesRequest::from_request(&req);
+        let wire = WireMessagesRequest::try_from_request(&req).unwrap();
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json["max_tokens"], 128);
         assert!(json.get("system").is_none());
         assert!(json.get("temperature").is_none());
+    }
+
+    #[test]
+    fn reasoning_none_auto_omit_off_budget_and_effort() {
+        let base = |policy: Option<ReasoningPolicy>, max_tokens: Option<u32>| ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens,
+            reasoning: policy,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let none_json = serde_json::to_value(
+            WireMessagesRequest::try_from_request(&base(None, Some(8192))).unwrap(),
+        )
+        .unwrap();
+        assert!(none_json.get("thinking").is_none());
+
+        let auto_json = serde_json::to_value(
+            WireMessagesRequest::try_from_request(&base(
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::Auto,
+                    effort: Some(ReasoningEffort::High),
+                    budget_tokens: Some(2000),
+                }),
+                Some(8192),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(auto_json.get("thinking").is_none());
+
+        let off_json = serde_json::to_value(
+            WireMessagesRequest::try_from_request(&base(
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::Off,
+                    effort: Some(ReasoningEffort::High),
+                    budget_tokens: None,
+                }),
+                Some(8192),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(off_json["thinking"]["type"], "disabled");
+        assert!(off_json["thinking"].get("budget_tokens").is_none());
+
+        // budget < 1024 → InvalidRequest
+        let err = WireMessagesRequest::try_from_request(&base(
+            Some(ReasoningPolicy {
+                mode: ReasoningMode::On,
+                effort: None,
+                budget_tokens: Some(1023),
+            }),
+            Some(8192),
+        ))
+        .unwrap_err();
+        assert_eq!(err.kind, ProtocolErrorKind::InvalidRequest);
+
+        // budget 1024 ok
+        let ok_json = serde_json::to_value(
+            WireMessagesRequest::try_from_request(&base(
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::On,
+                    effort: None,
+                    budget_tokens: Some(1024),
+                }),
+                Some(8192),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ok_json["thinking"]["type"], "enabled");
+        assert_eq!(ok_json["thinking"]["budget_tokens"], 1024);
+        assert_eq!(ok_json["thinking"]["display"], "summarized");
+
+        // On + none → default 4096; need max_tokens > 4096
+        let def_json = serde_json::to_value(
+            WireMessagesRequest::try_from_request(&base(
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::On,
+                    effort: None,
+                    budget_tokens: None,
+                }),
+                Some(8192),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(def_json["thinking"]["budget_tokens"], 4096);
+
+        // effort → budget table; budget wins over effort
+        let effort_json = serde_json::to_value(
+            WireMessagesRequest::try_from_request(&base(
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::On,
+                    effort: Some(ReasoningEffort::High),
+                    budget_tokens: None,
+                }),
+                Some(20000),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(effort_json["thinking"]["budget_tokens"], 16384);
+
+        let budget_wins = serde_json::to_value(
+            WireMessagesRequest::try_from_request(&base(
+                Some(ReasoningPolicy {
+                    mode: ReasoningMode::On,
+                    effort: Some(ReasoningEffort::High),
+                    budget_tokens: Some(2048),
+                }),
+                Some(8192),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(budget_wins["thinking"]["budget_tokens"], 2048);
+
+        // budget >= max_tokens → InvalidRequest
+        let err = WireMessagesRequest::try_from_request(&base(
+            Some(ReasoningPolicy {
+                mode: ReasoningMode::On,
+                effort: None,
+                budget_tokens: Some(4096),
+            }),
+            Some(4096),
+        ))
+        .unwrap_err();
+        assert_eq!(err.kind, ProtocolErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn multimodal_wire_image_blocks() {
+        use crate::types::{ChatMessage, ContentPart};
+
+        let text_only = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let json = serde_json::to_value(WireMessagesRequest::try_from_request(&text_only).unwrap())
+            .unwrap();
+        assert_eq!(json["messages"][0]["content"], "hi");
+
+        let with_images = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                parts: vec![
+                    ContentPart::Text {
+                        text: "look".into(),
+                    },
+                    ContentPart::ImageBase64 {
+                        media_type: "image/png".into(),
+                        data: "aGVsbG8=".into(),
+                    },
+                    ContentPart::ImageUrl {
+                        url: "https://example.com/b.png".into(),
+                        detail: None,
+                    },
+                ],
+                tool_call_id: None,
+                tool_calls: vec![],
+            }],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let json =
+            serde_json::to_value(WireMessagesRequest::try_from_request(&with_images).unwrap())
+                .unwrap();
+        let content = &json["messages"][0]["content"];
+        assert!(content.is_array());
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "aGVsbG8=");
+        assert_eq!(content[2]["type"], "image");
+        assert_eq!(content[2]["source"]["type"], "url");
+        assert_eq!(content[2]["source"]["url"], "https://example.com/b.png");
+        assert!(
+            AnthropicMessagesAdapter::new()
+                .unwrap()
+                .capabilities()
+                .vision_input
+        );
     }
 
     #[test]
@@ -455,8 +970,9 @@ mod tests {
             protocol: ProtocolKind::AnthropicMessages,
             base_url: base.clone(),
             api_key: SecretString::new("sk-test"),
+            auth: Default::default(),
         };
-        let headers = AnthropicMessagesAdapter::auth_headers(&with_key, true);
+        let headers = AnthropicMessagesAdapter::auth_headers(&with_key, true).unwrap();
         assert_eq!(
             headers.get("x-api-key").and_then(|v| v.to_str().ok()),
             Some("sk-test")
@@ -474,8 +990,9 @@ mod tests {
             protocol: ProtocolKind::AnthropicMessages,
             base_url: base,
             api_key: SecretString::new(""),
+            auth: Default::default(),
         };
-        let headers = AnthropicMessagesAdapter::auth_headers(&no_key, false);
+        let headers = AnthropicMessagesAdapter::auth_headers(&no_key, false).unwrap();
         assert!(!headers.contains_key("x-api-key"));
         assert!(headers.contains_key("anthropic-version"));
     }
@@ -483,7 +1000,7 @@ mod tests {
     #[test]
     fn parse_anthropic_error_uses_type_as_code() {
         let body = r#"{"type":"error","error":{"type":"authentication_error","message":"bad sk-secret-key"}}"#;
-        let (msg, code) = parse_anthropic_error_body(body);
+        let (msg, code) = crate::error::parse_anthropic_error_body(body);
         assert_eq!(code.as_deref(), Some("authentication_error"));
         assert!(msg.unwrap().contains("REDACTED"));
     }

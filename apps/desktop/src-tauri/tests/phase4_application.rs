@@ -12,8 +12,8 @@ use mprism_desktop_lib::storage::{
     ModelSource, ProviderSnapshot,
 };
 use mprism_protocol::{
-    ChatRequest, ChatStream, ModelInfo, ProtocolAdapter, ProtocolError, ProtocolErrorKind,
-    ProtocolKind, ProviderEndpoint, StreamEvent, TokenUsage,
+    ChatRequest, ChatStream, FinishReason, ModelInfo, ProtocolAdapter, ProtocolCapabilities,
+    ProtocolError, ProtocolErrorKind, ProtocolKind, ProviderEndpoint, StreamEvent, TokenUsage,
 };
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -35,6 +35,10 @@ struct FakeAdapter {
 impl ProtocolAdapter for FakeAdapter {
     fn kind(&self) -> ProtocolKind {
         self.kind
+    }
+
+    fn capabilities(&self) -> ProtocolCapabilities {
+        ProtocolCapabilities::v1_text_baseline()
     }
 
     async fn list_models(
@@ -66,9 +70,11 @@ impl ProtocolAdapter for FakeAdapter {
                     prompt_tokens: Some(3),
                     completion_tokens: Some(2),
                     total_tokens: Some(5),
+                    reasoning_tokens: None,
+                    cached_tokens: None,
                 })),
                 Ok(StreamEvent::Completed {
-                    finish_reason: Some("stop".into()),
+                    finish_reason: FinishReason::Stop,
                 }),
             ]))),
             FakeMode::Fail => Err(ProtocolError::new(
@@ -209,7 +215,7 @@ async fn success_stream_persists_user_and_assistant() {
         .all(|event| event.assistant_message_id == assistant.id));
 
     let request = requests.lock().unwrap()[0].clone();
-    assert_eq!(request.messages.last().unwrap().content, "question");
+    assert_eq!(request.messages.last().unwrap().text_content(), "question");
     assert_eq!(request.temperature, Some(0.2));
 }
 
@@ -404,7 +410,7 @@ fn context_excludes_reasoning_usage_and_error_assistant() {
     let context = state.sessions.build_context(session.id).unwrap();
     let contents: Vec<_> = context
         .iter()
-        .map(|message| message.content.as_str())
+        .map(|message| message.text_content())
         .collect();
     assert_eq!(contents, vec!["system", "user", "answer"]);
 }

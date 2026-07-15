@@ -75,27 +75,23 @@ impl SessionService {
         let loaded = self.store.load_messages(session_id)?;
         let mut context = Vec::new();
         if !meta.system_prompt.trim().is_empty() {
-            context.push(ChatMessage {
-                role: ChatRole::System,
-                content: meta.system_prompt.trim().to_string(),
-            });
+            context.push(ChatMessage::text(
+                ChatRole::System,
+                meta.system_prompt.trim(),
+            ));
         }
         for message in loaded.messages {
             match message.role {
-                MessageRole::User => context.push(ChatMessage {
-                    role: ChatRole::User,
-                    content: message.content,
-                }),
+                MessageRole::User => {
+                    context.push(ChatMessage::text(ChatRole::User, message.content))
+                }
                 MessageRole::Assistant => {
                     let include = matches!(
                         message.status,
                         Some(AssistantStatus::Completed | AssistantStatus::Stopped)
                     ) && !message.content.trim().is_empty();
                     if include {
-                        context.push(ChatMessage {
-                            role: ChatRole::Assistant,
-                            content: message.content,
-                        });
+                        context.push(ChatMessage::text(ChatRole::Assistant, message.content));
                     }
                 }
             }
@@ -103,4 +99,3 @@ impl SessionService {
         Ok(context)
     }
 }
-

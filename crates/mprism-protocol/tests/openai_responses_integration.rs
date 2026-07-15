@@ -113,17 +113,14 @@ async fn stream_chat_semantic_sse_and_store_false() {
     let request = ChatRequest {
         model: "m".into(),
         messages: vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: "sys".into(),
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: "hi".into(),
-            },
+            ChatMessage::text(ChatRole::System, "sys"),
+            ChatMessage::text(ChatRole::User, "hi"),
         ],
         temperature: Some(0.2),
         max_tokens: Some(64),
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
     let mut content = String::new();
@@ -142,8 +139,9 @@ async fn stream_chat_semantic_sse_and_store_false() {
             }
             StreamEvent::Completed { finish_reason } => {
                 completed = true;
-                assert_eq!(finish_reason.as_deref(), Some("stop"));
+                assert_eq!(finish_reason, mprism_protocol::FinishReason::Stop);
             }
+            StreamEvent::ToolCallDelta { .. } | StreamEvent::ToolCallFinished { .. } => {}
         }
     }
     assert_eq!(content, "Hello");
@@ -170,12 +168,12 @@ async fn stream_chat_handles_crlf_and_unknown_events() {
     let ep = endpoint(&format!("{}/v1", server.uri()), "");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: None,
         max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
     let mut content = String::new();
@@ -205,12 +203,12 @@ async fn stream_chat_unexpected_eof() {
     let ep = endpoint(&format!("{}/v1", server.uri()), "k");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: None,
         max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
     let mut saw_content = false;
@@ -250,12 +248,12 @@ async fn stream_chat_inline_error_event() {
     let ep = endpoint(&format!("{}/v1", server.uri()), "k");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: None,
         max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
     let mut saw_err = false;
@@ -284,12 +282,12 @@ async fn stream_chat_rate_limited() {
     let ep = endpoint(&format!("{}/v1", server.uri()), "k");
     let request = ChatRequest {
         model: "m".into(),
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hi".into(),
-        }],
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
         temperature: None,
         max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
     };
     let err = match adapter.stream_chat(&ep, request).await {
         Ok(_) => panic!("expected error"),
@@ -311,4 +309,91 @@ async fn rejects_wrong_protocol_kind() {
     .unwrap();
     let err = adapter.list_models(&ep).await.unwrap_err();
     assert_eq!(err.kind, ProtocolErrorKind::Unsupported);
+}
+
+#[tokio::test]
+async fn stream_chat_finish_reasons() {
+    for (event, expected) in [
+        (
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+            mprism_protocol::FinishReason::Stop,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            mprism_protocol::FinishReason::Length,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#,
+            mprism_protocol::FinishReason::ContentFilter,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let body = format!("data: {event}\n\n");
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let adapter = OpenAiResponsesAdapter::new().unwrap();
+        let ep = endpoint(&format!("{}/v1", server.uri()), "k");
+        let request = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
+        let mut finished = None;
+        let mut n = 0usize;
+        while let Some(item) = stream.next().await {
+            if let StreamEvent::Completed { finish_reason } = item.unwrap() {
+                n += 1;
+                finished = Some(finish_reason);
+            }
+        }
+        assert_eq!(n, 1);
+        assert_eq!(finished, Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn stream_chat_drop_without_completed() {
+    let server = MockServer::start().await;
+    let body = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let adapter = OpenAiResponsesAdapter::new().unwrap();
+    let ep = endpoint(&format!("{}/v1", server.uri()), "k");
+    let request = ChatRequest {
+        model: "m".into(),
+        messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+        temperature: None,
+        max_tokens: None,
+        reasoning: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let mut stream = adapter.stream_chat(&ep, request).await.unwrap();
+    let first = stream.next().await.unwrap().unwrap();
+    assert!(matches!(first, StreamEvent::ContentDelta { .. }));
+    drop(stream);
 }

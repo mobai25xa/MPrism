@@ -147,4 +147,3 @@ pub fn check_ipc_schema(version: u32) -> Result<(), AppError> {
     }
     Ok(())
 }
-

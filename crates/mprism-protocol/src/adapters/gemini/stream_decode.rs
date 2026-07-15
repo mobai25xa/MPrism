@@ -1,7 +1,9 @@
 //! Decode Gemini streamGenerateContent SSE JSON into StreamEvent.
 
 use crate::error::{redact_secrets, ProtocolError, ProtocolErrorKind};
-use crate::types::{StreamEvent, TokenUsage};
+use crate::finish::gemini_generate_content as map_finish;
+use crate::types::StreamEvent;
+use crate::usage::from_gemini_usage_metadata;
 use serde_json::Value;
 
 /// Per-stream decoder state for Gemini SSE frames.
@@ -27,7 +29,7 @@ pub fn decode_sse_data(
         }
         state.completed = true;
         return Ok(vec![StreamEvent::Completed {
-            finish_reason: Some("STOP".into()),
+            finish_reason: map_finish(Some("STOP")),
         }]);
     }
 
@@ -76,7 +78,36 @@ pub fn decode_sse_data(
                 .and_then(|c| c.get("parts"))
                 .and_then(|p| p.as_array())
             {
-                for part in parts {
+                for (part_index, part) in parts.iter().enumerate() {
+                    if let Some(fc) = part.get("functionCall") {
+                        let name = fc
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let args = fc
+                            .get("args")
+                            .cloned()
+                            .unwrap_or(Value::Object(Default::default()));
+                        let arguments =
+                            serde_json::to_string(&args).unwrap_or_else(|_| "{}".into());
+                        // Gemini often delivers the full functionCall in one part (not token-streamed).
+                        let index = Some(part_index as u32);
+                        let id = name.clone();
+                        events.push(StreamEvent::ToolCallDelta {
+                            id: Some(id.clone()),
+                            name: Some(name.clone()),
+                            arguments_delta: arguments.clone(),
+                            index,
+                        });
+                        events.push(StreamEvent::ToolCallFinished {
+                            id,
+                            name,
+                            arguments,
+                            index,
+                        });
+                        continue;
+                    }
                     let thought = part
                         .get("thought")
                         .and_then(|t| t.as_bool())
@@ -106,57 +137,24 @@ pub fn decode_sse_data(
                 .filter(|s| !s.is_empty())
             {
                 if !state.usage_emitted {
-                    if let Some(usage) = usage_from_value(value.get("usageMetadata")) {
-                        state.usage_emitted = true;
-                        events.push(StreamEvent::Usage(usage));
+                    if let Some(usage_val) = value.get("usageMetadata") {
+                        if let Some(usage) = from_gemini_usage_metadata(usage_val) {
+                            state.usage_emitted = true;
+                            events.push(StreamEvent::Usage(usage));
+                        }
                     }
                 }
                 state.completed = true;
                 events.push(StreamEvent::Completed {
-                    finish_reason: Some(reason.to_string()),
+                    finish_reason: map_finish(Some(reason)),
                 });
                 return Ok(events);
             }
         }
     }
 
-    // Usage-only frame without finish yet: keep for later terminal; still surface if present.
-    if !state.usage_emitted {
-        if let Some(usage) = usage_from_value(value.get("usageMetadata")) {
-            // Defer emission until Completed unless we only got usage (rare).
-            // Prefer bundling with Completed; stash by emitting only at finish.
-            // If usage arrives early, store via a lightweight re-parse: attach by setting flag false
-            // and re-read on finish — simplest: emit usage only with finishReason path above.
-            // Here: ignore early usage to avoid double emit; final frame usually includes both.
-            let _ = usage;
-        }
-    }
-
+    // Early usage-only frames are deferred until finishReason to avoid double emit.
     Ok(events)
-}
-
-fn usage_from_value(usage: Option<&Value>) -> Option<TokenUsage> {
-    let usage = usage?;
-    let prompt = usage
-        .get("promptTokenCount")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32);
-    let completion = usage
-        .get("candidatesTokenCount")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32);
-    let total = usage
-        .get("totalTokenCount")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32);
-    if prompt.is_none() && completion.is_none() && total.is_none() {
-        return None;
-    }
-    Some(TokenUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: total,
-    })
 }
 
 fn error_from_json(value: &Value) -> ProtocolError {
@@ -189,6 +187,7 @@ fn error_from_json(value: &Value) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::FinishReason;
 
     #[test]
     fn text_and_thought_deltas() {
@@ -210,10 +209,34 @@ mod tests {
     }
 
     #[test]
+    fn function_call_part_emits_tool_events() {
+        let mut state = EventDecodeState::default();
+        let events = decode_sse_data(
+            r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"lookup","args":{"q":1}}}]},"finishReason":"FUNCTION_CALL"}]}"#,
+            &mut state,
+        )
+        .unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolCallFinished {
+                name,
+                arguments,
+                ..
+            } if name == "lookup" && arguments.contains("\"q\":1")
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Completed {
+                finish_reason: FinishReason::ToolCalls
+            })
+        ));
+    }
+
+    #[test]
     fn finish_emits_usage_and_completed() {
         let mut state = EventDecodeState::default();
         let events = decode_sse_data(
-            r#"{"candidates":[{"content":{"parts":[{"text":"lo"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}}"#,
+            r#"{"candidates":[{"content":{"parts":[{"text":"lo"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5,"thoughtsTokenCount":7}}"#,
             &mut state,
         )
         .unwrap();
@@ -227,16 +250,42 @@ mod tests {
                 assert_eq!(u.prompt_tokens, Some(3));
                 assert_eq!(u.completion_tokens, Some(2));
                 assert_eq!(u.total_tokens, Some(5));
+                assert_eq!(u.reasoning_tokens, Some(7));
             }
             other => panic!("expected usage, got {other:?}"),
         }
         match &events[2] {
             StreamEvent::Completed { finish_reason } => {
-                assert_eq!(finish_reason.as_deref(), Some("STOP"));
+                assert_eq!(finish_reason, &FinishReason::Stop);
             }
             other => panic!("expected completed, got {other:?}"),
         }
         assert!(state.completed);
+    }
+
+    #[test]
+    fn finish_reason_table() {
+        for (reason, expected) in [
+            ("MAX_TOKENS", FinishReason::Length),
+            ("SAFETY", FinishReason::ContentFilter),
+            ("FUNCTION_CALL", FinishReason::ToolCalls),
+            ("RECITATION", FinishReason::Other("RECITATION".into())),
+        ] {
+            let mut state = EventDecodeState::default();
+            let events = decode_sse_data(
+                &format!(
+                    r#"{{"candidates":[{{"content":{{"parts":[]}},"finishReason":"{reason}"}}]}}"#
+                ),
+                &mut state,
+            )
+            .unwrap();
+            assert_eq!(
+                events,
+                vec![StreamEvent::Completed {
+                    finish_reason: expected
+                }]
+            );
+        }
     }
 
     #[test]

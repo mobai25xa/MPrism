@@ -77,6 +77,9 @@ impl ChatService {
             messages: context,
             temperature: selected.temperature,
             max_tokens: selected.max_tokens,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
         };
         request.validate()?;
 
@@ -147,6 +150,10 @@ impl ChatService {
                                 cancellation.cancel();
                             }
                         }
+                        Some(Ok(StreamEvent::ToolCallDelta { .. }))
+                        | Some(Ok(StreamEvent::ToolCallFinished { .. })) => {
+                            // V2 wire events: desktop storage not wired yet.
+                        }
                         Some(Ok(StreamEvent::Usage(value))) => {
                             let record = usage_record(value);
                             usage = Some(record.clone());
@@ -166,7 +173,8 @@ impl ChatService {
                         Some(Ok(StreamEvent::Completed {
                             finish_reason: value,
                         })) => {
-                            finish_reason = value.clone();
+                            let value_str = Some(value.as_str().to_string());
+                            finish_reason = value_str.clone();
                             let _ = send_event(
                                 sink,
                                 request_id,
@@ -174,7 +182,7 @@ impl ChatService {
                                 assistant_message_id,
                                 &mut sequence,
                                 StreamEventPayload::Completed {
-                                    finish_reason: value,
+                                    finish_reason: value_str,
                                 },
                             );
                             break;

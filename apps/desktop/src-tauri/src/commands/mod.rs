@@ -145,4 +145,3 @@ pub fn cancel_chat(
         was_running: state.chat.cancel(request_id),
     })
 }
-

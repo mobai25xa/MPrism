@@ -70,7 +70,6 @@ impl ProviderService {
         Ok(())
     }
 
-
     pub fn set_defaults(
         &self,
         provider_id: Option<Uuid>,
@@ -164,4 +163,3 @@ impl From<ModelInfo> for ModelInfoPayload {
         }
     }
 }
-

@@ -85,6 +85,10 @@ impl From<ProtocolError> for AppError {
                 ("auth", "模型服务鉴权失败，请检查 API Key")
             }
             ProtocolErrorKind::RateLimited => ("rate_limited", "模型服务请求过于频繁，请稍后重试"),
+            ProtocolErrorKind::ContextLengthExceeded => {
+                ("context_length", "上下文过长，请缩短内容后重试")
+            }
+            ProtocolErrorKind::ContentFilter => ("content_filter", "内容被模型安全策略拦截"),
             ProtocolErrorKind::ProviderUnavailable => {
                 ("provider_unavailable", "模型服务暂时不可用")
             }

@@ -2,13 +2,12 @@
 
 use super::chunk::{decode_sse_data, ChunkDecodeState};
 use crate::adapter::{ChatStream, ProtocolAdapter};
-use crate::error::{
-    kind_from_status, parse_provider_error_body, redact_secrets, ProtocolError, ProtocolErrorKind,
-    ERROR_BODY_LIMIT,
-};
+use crate::auth::{apply_api_key_query, merge_extra_headers};
+use crate::error::{map_http_error, ErrorBodyFamily, ProtocolError, ProtocolErrorKind};
 use crate::sse::SseParser;
 use crate::types::{
-    join_api_path, ChatRequest, ModelInfo, ProtocolKind, ProviderEndpoint, StreamEvent,
+    join_api_path, ChatRequest, ModelInfo, ProtocolCapabilities, ProtocolKind, ProviderEndpoint,
+    StreamEvent,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -21,17 +20,24 @@ use tokio::time::timeout;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Stream idle timeout (no body bytes): model-protocol-sdk §5.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// OpenAI-compatible adapter (Chat Completions + Models).
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleAdapter {
     client: Client,
+    stream_idle_timeout: Duration,
 }
 
 impl OpenAiCompatibleAdapter {
     /// Create an adapter with default HTTP timeouts.
     pub fn new() -> Result<Self, ProtocolError> {
+        Self::with_stream_idle_timeout(STREAM_IDLE_TIMEOUT)
+    }
+
+    /// Create an adapter with a custom stream idle timeout (tests / specialized hosts).
+    pub fn with_stream_idle_timeout(stream_idle_timeout: Duration) -> Result<Self, ProtocolError> {
         let client = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
@@ -41,10 +47,16 @@ impl OpenAiCompatibleAdapter {
                     format!("创建 HTTP 客户端失败: {err}"),
                 )
             })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            stream_idle_timeout,
+        })
     }
 
-    fn auth_headers(endpoint: &ProviderEndpoint, accept_event_stream: bool) -> HeaderMap {
+    fn auth_headers(
+        endpoint: &ProviderEndpoint,
+        accept_event_stream: bool,
+    ) -> Result<HeaderMap, ProtocolError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if accept_event_stream {
@@ -58,40 +70,15 @@ impl OpenAiCompatibleAdapter {
                 headers.insert(AUTHORIZATION, v);
             }
         }
-        headers
+        merge_extra_headers(&mut headers, &endpoint.auth)?;
+        Ok(headers)
     }
 
     async fn map_error_response(response: Response) -> ProtocolError {
-        let status = response.status();
-        let request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let kind = kind_from_status(status.as_u16());
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let bytes = response.bytes().await.unwrap_or_default();
-        let limited = if bytes.len() > ERROR_BODY_LIMIT {
-            &bytes[..ERROR_BODY_LIMIT]
-        } else {
-            &bytes
-        };
-        let body = String::from_utf8_lossy(limited);
-        let (message, code) = parse_provider_error_body(&body);
-        let message = message.unwrap_or_else(|| {
-            if body.trim().is_empty() {
-                format!("服务商返回 HTTP {}", status.as_u16())
-            } else {
-                redact_secrets(body.trim())
-            }
-        });
-        let mut err = ProtocolError::new(kind, message).with_http_status(status.as_u16());
-        if let Some(code) = code {
-            err = err.with_provider_code(code);
-        }
-        if let Some(id) = request_id {
-            err = err.with_request_id(id);
-        }
-        err
+        map_http_error(status, &headers, &bytes, ErrorBodyFamily::OpenAi)
     }
 }
 
@@ -107,6 +94,20 @@ impl ProtocolAdapter for OpenAiCompatibleAdapter {
         ProtocolKind::OpenAiChatCompletions
     }
 
+    fn capabilities(&self) -> ProtocolCapabilities {
+        ProtocolCapabilities {
+            streaming: true,
+            list_models: true,
+            reasoning_output: true,
+            reasoning_control: false,
+            tools: true,
+            vision_input: true,
+            stream_usage: true,
+            custom_headers: true,
+            api_key_query: true,
+        }
+    }
+
     async fn list_models(
         &self,
         endpoint: &ProviderEndpoint,
@@ -118,11 +119,11 @@ impl ProtocolAdapter for OpenAiCompatibleAdapter {
             ));
         }
 
-        let url = join_api_path(&endpoint.base_url, "models")?;
+        let url = apply_api_key_query(join_api_path(&endpoint.base_url, "models")?, endpoint);
         let request = self
             .client
             .get(url)
-            .headers(Self::auth_headers(endpoint, false));
+            .headers(Self::auth_headers(endpoint, false)?);
 
         let response = timeout(LIST_TIMEOUT, request.send())
             .await
@@ -156,13 +157,17 @@ impl ProtocolAdapter for OpenAiCompatibleAdapter {
             ));
         }
         request.validate()?;
+        request.check_capabilities(&self.capabilities())?;
 
-        let url = join_api_path(&endpoint.base_url, "chat/completions")?;
-        let wire = WireChatRequest::from_request(&request);
+        let url = apply_api_key_query(
+            join_api_path(&endpoint.base_url, "chat/completions")?,
+            endpoint,
+        );
+        let wire = WireChatRequest::try_from_request(&request)?;
         let http_request = self
             .client
             .post(url)
-            .headers(Self::auth_headers(endpoint, true))
+            .headers(Self::auth_headers(endpoint, true)?)
             .json(&wire);
 
         let response = http_request.send().await.map_err(map_reqwest_error)?;
@@ -171,14 +176,16 @@ impl ProtocolAdapter for OpenAiCompatibleAdapter {
         }
 
         let mut byte_stream = response.bytes_stream();
+        let idle = self.stream_idle_timeout;
         let stream = async_stream::stream! {
             let mut parser = SseParser::new();
             let mut decode_state = ChunkDecodeState::default();
             let mut completed = false;
             let mut failed = false;
 
+            // Dropping this stream cancels further polling and does not fabricate Completed (§3.8).
             while !completed && !failed {
-                let next = timeout(STREAM_IDLE_TIMEOUT, byte_stream.next()).await;
+                let next = timeout(idle, byte_stream.next()).await;
                 match next {
                     Err(_) => {
                         failed = true;
@@ -231,7 +238,9 @@ impl ProtocolAdapter for OpenAiCompatibleAdapter {
                         if !completed && !failed {
                             if decode_state.finish_reason.is_some() {
                                 yield Ok(StreamEvent::Completed {
-                                    finish_reason: decode_state.finish_reason.clone(),
+                                    finish_reason: crate::finish::openai_chat_completions(
+                                        decode_state.finish_reason.as_deref(),
+                                    ),
                                 });
                             } else {
                                 yield Err(ProtocolError::new(
@@ -303,37 +312,248 @@ fn parse_models_body(body: &[u8]) -> Result<Vec<ModelInfo>, ProtocolError> {
 #[derive(Debug, Serialize)]
 struct WireChatRequest {
     model: String,
-    messages: Vec<WireChatMessage>,
+    messages: Vec<Value>,
     stream: bool,
+    /// Official field for streaming usage; not part of public ChatRequest API.
+    stream_options: WireStreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<WireTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
-struct WireChatMessage {
-    role: String,
-    content: String,
+struct WireStreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WireTool {
+    #[serde(rename = "type")]
+    tool_type: &'static str,
+    function: WireFunctionDef,
+}
+
+#[derive(Debug, Serialize)]
+struct WireFunctionDef {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    parameters: Value,
 }
 
 impl WireChatRequest {
-    fn from_request(request: &ChatRequest) -> Self {
-        Self {
+    /// Encode Chat Completions body. Reasoning control is unsupported (mapping-v2 §6).
+    /// Tools are wire-only; this crate does not execute them.
+    fn try_from_request(request: &ChatRequest) -> Result<Self, ProtocolError> {
+        validate_chat_completions_reasoning(request.reasoning.as_ref())?;
+        let tools = encode_chat_tools(request.tools.as_ref());
+        let tool_choice = encode_chat_tool_choice(request.tool_choice.as_ref(), tools.is_some());
+        Ok(Self {
             model: request.model.trim().to_string(),
             messages: request
                 .messages
                 .iter()
-                .map(|m| WireChatMessage {
-                    role: m.role.as_str().to_string(),
-                    content: m.content.clone(),
-                })
-                .collect(),
+                .map(encode_chat_message)
+                .collect::<Result<Vec<_>, _>>()?,
             stream: true,
+            stream_options: WireStreamOptions {
+                include_usage: true,
+            },
             temperature: request.temperature,
             max_tokens: request.max_tokens,
+            tools,
+            tool_choice,
+        })
+    }
+}
+
+fn encode_chat_tools(tools: Option<&Vec<crate::types::ToolDefinition>>) -> Option<Vec<WireTool>> {
+    tools.map(|tools| {
+        tools
+            .iter()
+            .map(|t| WireTool {
+                tool_type: "function",
+                function: WireFunctionDef {
+                    name: t.name.trim().to_string(),
+                    description: t.description.clone(),
+                    parameters: t.parameters.clone(),
+                },
+            })
+            .collect()
+    })
+}
+
+fn encode_chat_tool_choice(
+    choice: Option<&crate::types::ToolChoice>,
+    has_tools: bool,
+) -> Option<Value> {
+    use crate::types::ToolChoice;
+    match choice {
+        None if has_tools => Some(Value::String("auto".into())),
+        None => None,
+        Some(ToolChoice::Auto) => Some(Value::String("auto".into())),
+        Some(ToolChoice::None) => Some(Value::String("none".into())),
+        Some(ToolChoice::Required) => Some(Value::String("required".into())),
+        Some(ToolChoice::Named { name }) => Some(serde_json::json!({
+            "type": "function",
+            "function": { "name": name }
+        })),
+    }
+}
+
+fn encode_chat_message(message: &crate::types::ChatMessage) -> Result<Value, ProtocolError> {
+    use crate::types::ChatRole;
+    match message.role {
+        ChatRole::Tool => {
+            let tool_call_id = message
+                .tool_call_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorKind::InvalidRequest,
+                        "Tool 消息必须提供 tool_call_id",
+                    )
+                })?;
+            Ok(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": message.text_content(),
+            }))
+        }
+        ChatRole::Assistant if !message.tool_calls.is_empty() => {
+            let tool_calls: Vec<Value> = message
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        }
+                    })
+                })
+                .collect();
+            let mut obj = serde_json::Map::new();
+            obj.insert("role".into(), Value::String("assistant".into()));
+            obj.insert("content".into(), encode_chat_completions_content(message)?);
+            obj.insert("tool_calls".into(), Value::Array(tool_calls));
+            Ok(Value::Object(obj))
+        }
+        role => Ok(serde_json::json!({
+            "role": role.as_str(),
+            "content": encode_chat_completions_content(message)?,
+        })),
+    }
+}
+
+/// mapping-v2 §4: single Text → string; multi-part or image → content array.
+fn encode_chat_completions_content(
+    message: &crate::types::ChatMessage,
+) -> Result<Value, ProtocolError> {
+    use crate::types::ContentPart;
+    if !needs_multipart_content(&message.parts) {
+        let text = message.text_content();
+        // Assistant + tool_calls only may have empty content.
+        if text.is_empty() && !message.tool_calls.is_empty() {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::String(text));
+    }
+
+    let mut blocks = Vec::with_capacity(message.parts.len());
+    for part in &message.parts {
+        match part {
+            ContentPart::Text { text } => {
+                if text.is_empty() {
+                    continue;
+                }
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": text,
+                }));
+            }
+            ContentPart::ImageUrl { url, detail } => {
+                let mut image_url = serde_json::Map::new();
+                image_url.insert("url".into(), Value::String(url.clone()));
+                if let Some(d) = detail.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    image_url.insert("detail".into(), Value::String(d.to_string()));
+                }
+                blocks.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": Value::Object(image_url),
+                }));
+            }
+            ContentPart::ImageBase64 { media_type, data } => {
+                let data_url = format_data_url(media_type, data);
+                blocks.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": data_url },
+                }));
+            }
         }
     }
+    if blocks.is_empty() {
+        if !message.tool_calls.is_empty() {
+            return Ok(Value::Null);
+        }
+        return Err(ProtocolError::new(
+            ProtocolErrorKind::InvalidRequest,
+            "消息 content 编码结果为空",
+        ));
+    }
+    Ok(Value::Array(blocks))
+}
+
+fn needs_multipart_content(parts: &[crate::types::ContentPart]) -> bool {
+    use crate::types::ContentPart;
+    let has_image = parts.iter().any(|p| {
+        matches!(
+            p,
+            ContentPart::ImageUrl { .. } | ContentPart::ImageBase64 { .. }
+        )
+    });
+    if has_image {
+        return true;
+    }
+    // Multiple text parts → array per mapping-v2 §4.
+    parts
+        .iter()
+        .filter(|p| matches!(p, ContentPart::Text { .. }))
+        .count()
+        > 1
+}
+
+fn format_data_url(media_type: &str, data: &str) -> String {
+    let media_type = media_type.trim();
+    let data: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+    format!("data:{media_type};base64,{data}")
+}
+
+/// Chat Completions: only None/Auto. On/Off/effort/budget → Unsupported.
+fn validate_chat_completions_reasoning(
+    policy: Option<&crate::types::ReasoningPolicy>,
+) -> Result<(), ProtocolError> {
+    use crate::types::ReasoningMode;
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    // Auto: ignore effort/budget; do not send control fields.
+    if matches!(policy.mode, ReasoningMode::Auto) {
+        return Ok(());
+    }
+    Err(ProtocolError::new(
+        ProtocolErrorKind::Unsupported,
+        "OpenAI Chat Completions 不支持推理控制（请使用 Responses 或 None/Auto）",
+    ))
 }
 
 #[cfg(test)]
@@ -341,24 +561,245 @@ mod tests {
     use super::*;
     use crate::secret::SecretString;
     use crate::types::normalize_base_url;
-    use crate::types::ChatRole;
+    use crate::types::{ChatRole, ReasoningEffort, ReasoningMode, ReasoningPolicy};
 
     #[test]
     fn wire_request_omits_optional_none() {
         let req = ChatRequest {
             model: "m".into(),
-            messages: vec![crate::types::ChatMessage {
+            messages: vec![crate::types::ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let wire = WireChatRequest::try_from_request(&req).unwrap();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["stream"], true);
+        assert_eq!(json["stream_options"]["include_usage"], true);
+        assert!(json.get("temperature").is_none());
+        assert!(json.get("max_tokens").is_none());
+        assert!(json.get("reasoning").is_none());
+        assert!(json.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn reasoning_auto_ok_on_and_off_unsupported() {
+        let auto = ChatRequest {
+            model: "m".into(),
+            messages: vec![crate::types::ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens: None,
+            reasoning: Some(ReasoningPolicy {
+                mode: ReasoningMode::Auto,
+                effort: Some(ReasoningEffort::High),
+                budget_tokens: Some(1000),
+            }),
+            tools: None,
+            tool_choice: None,
+        };
+        let wire = WireChatRequest::try_from_request(&auto).unwrap();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert!(json.get("reasoning").is_none());
+
+        for mode in [ReasoningMode::On, ReasoningMode::Off] {
+            let req = ChatRequest {
+                model: "m".into(),
+                messages: vec![crate::types::ChatMessage::text(ChatRole::User, "hi")],
+                temperature: None,
+                max_tokens: None,
+                reasoning: Some(ReasoningPolicy {
+                    mode,
+                    effort: Some(ReasoningEffort::Low),
+                    budget_tokens: None,
+                }),
+                tools: None,
+                tool_choice: None,
+            };
+            let err = WireChatRequest::try_from_request(&req).unwrap_err();
+            assert_eq!(err.kind, ProtocolErrorKind::Unsupported);
+        }
+    }
+
+    #[test]
+    fn capabilities_match_matrix_v2() {
+        let caps = OpenAiCompatibleAdapter::new().unwrap().capabilities();
+        assert!(caps.streaming);
+        assert!(caps.list_models);
+        assert!(caps.reasoning_output);
+        assert!(!caps.reasoning_control);
+        assert!(caps.tools);
+        assert!(caps.vision_input);
+        assert!(caps.stream_usage);
+        assert!(caps.custom_headers);
+        assert!(caps.api_key_query);
+    }
+
+    #[test]
+    fn tools_wire_encoding_and_none_omitted() {
+        use crate::types::{ToolChoice, ToolDefinition};
+        let none = ChatRequest {
+            model: "m".into(),
+            messages: vec![crate::types::ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let json = serde_json::to_value(WireChatRequest::try_from_request(&none).unwrap()).unwrap();
+        assert!(json.get("tools").is_none());
+        assert!(json.get("tool_choice").is_none());
+
+        let with = ChatRequest {
+            model: "m".into(),
+            messages: vec![
+                crate::types::ChatMessage::text(ChatRole::User, "hi"),
+                crate::types::ChatMessage {
+                    role: ChatRole::Assistant,
+                    parts: vec![],
+                    tool_call_id: None,
+                    tool_calls: vec![crate::types::ToolCall {
+                        id: "call_1".into(),
+                        name: "lookup".into(),
+                        arguments: r#"{"q":1}"#.into(),
+                    }],
+                },
+                crate::types::ChatMessage {
+                    role: ChatRole::Tool,
+                    parts: vec![crate::types::ContentPart::Text { text: "ok".into() }],
+                    tool_call_id: Some("call_1".into()),
+                    tool_calls: vec![],
+                },
+            ],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: Some(vec![ToolDefinition {
+                name: "lookup".into(),
+                description: Some("d".into()),
+                parameters: serde_json::json!({"type":"object"}),
+            }]),
+            tool_choice: Some(ToolChoice::Named {
+                name: "lookup".into(),
+            }),
+        };
+        assert!(with.validate().is_ok());
+        let json = serde_json::to_value(WireChatRequest::try_from_request(&with).unwrap()).unwrap();
+        assert_eq!(json["tools"][0]["type"], "function");
+        assert_eq!(json["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(json["tool_choice"]["type"], "function");
+        assert_eq!(json["tool_choice"]["function"]["name"], "lookup");
+        assert_eq!(json["messages"][2]["role"], "tool");
+        assert_eq!(json["messages"][2]["tool_call_id"], "call_1");
+        assert_eq!(json["messages"][1]["tool_calls"][0]["id"], "call_1");
+
+        for choice in [ToolChoice::Auto, ToolChoice::None, ToolChoice::Required] {
+            let req = ChatRequest {
+                model: "m".into(),
+                messages: vec![crate::types::ChatMessage::text(ChatRole::User, "hi")],
+                temperature: None,
+                max_tokens: None,
+                reasoning: None,
+                tools: Some(vec![ToolDefinition {
+                    name: "t".into(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                }]),
+                tool_choice: Some(choice.clone()),
+            };
+            let json =
+                serde_json::to_value(WireChatRequest::try_from_request(&req).unwrap()).unwrap();
+            match choice {
+                ToolChoice::Auto => assert_eq!(json["tool_choice"], "auto"),
+                ToolChoice::None => assert_eq!(json["tool_choice"], "none"),
+                ToolChoice::Required => assert_eq!(json["tool_choice"], "required"),
+                ToolChoice::Named { .. } => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn multimodal_wire_url_and_base64_and_text_only() {
+        use crate::types::{ChatMessage, ContentPart};
+
+        // Pure text remains string-shaped (V1 path).
+        let text_only = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::text(ChatRole::User, "hi")],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let json =
+            serde_json::to_value(WireChatRequest::try_from_request(&text_only).unwrap()).unwrap();
+        assert_eq!(json["messages"][0]["content"], "hi");
+
+        let with_url = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
                 role: ChatRole::User,
-                content: "hi".into(),
+                parts: vec![
+                    ContentPart::Text { text: "see".into() },
+                    ContentPart::ImageUrl {
+                        url: "https://example.com/a.png".into(),
+                        detail: Some("high".into()),
+                    },
+                ],
+                tool_call_id: None,
+                tool_calls: vec![],
             }],
             temperature: None,
             max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
         };
-        let wire = WireChatRequest::from_request(&req);
-        let json = serde_json::to_value(&wire).unwrap();
-        assert_eq!(json["stream"], true);
-        assert!(json.get("temperature").is_none());
-        assert!(json.get("max_tokens").is_none());
+        let json =
+            serde_json::to_value(WireChatRequest::try_from_request(&with_url).unwrap()).unwrap();
+        let content = &json["messages"][0]["content"];
+        assert!(content.is_array());
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "see");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "https://example.com/a.png");
+        assert_eq!(content[1]["image_url"]["detail"], "high");
+
+        let with_b64 = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                parts: vec![
+                    ContentPart::Text { text: "see".into() },
+                    ContentPart::ImageBase64 {
+                        media_type: "image/png".into(),
+                        data: "aGVsbG8=".into(),
+                    },
+                ],
+                tool_call_id: None,
+                tool_calls: vec![],
+            }],
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let json =
+            serde_json::to_value(WireChatRequest::try_from_request(&with_b64).unwrap()).unwrap();
+        assert_eq!(
+            json["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        assert!(
+            OpenAiCompatibleAdapter::new()
+                .unwrap()
+                .capabilities()
+                .vision_input
+        );
     }
 
     #[test]
@@ -386,16 +827,18 @@ mod tests {
             protocol: ProtocolKind::OpenAiChatCompletions,
             base_url: base.clone(),
             api_key: SecretString::new("sk-test"),
+            auth: Default::default(),
         };
-        let headers = OpenAiCompatibleAdapter::auth_headers(&with_key, true);
+        let headers = OpenAiCompatibleAdapter::auth_headers(&with_key, true).unwrap();
         assert!(headers.contains_key(AUTHORIZATION));
 
         let no_key = ProviderEndpoint {
             protocol: ProtocolKind::OpenAiChatCompletions,
             base_url: base,
             api_key: SecretString::new(""),
+            auth: Default::default(),
         };
-        let headers = OpenAiCompatibleAdapter::auth_headers(&no_key, false);
+        let headers = OpenAiCompatibleAdapter::auth_headers(&no_key, false).unwrap();
         assert!(!headers.contains_key(AUTHORIZATION));
     }
 }

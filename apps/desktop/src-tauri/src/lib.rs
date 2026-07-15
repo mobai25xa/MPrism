@@ -64,4 +64,3 @@ fn apply_window_material(window: &WebviewWindow) {
         eprintln!("window effects unavailable, using solid background: {err}");
     }
 }
-
